@@ -689,6 +689,37 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gptq_gemm_rdna3
         )
 
 
+def moe_pack_bf16_rdna4(w: torch.Tensor) -> None:
+    """In-place repack of bf16 expert weights [E, R, K] into the WMMA fragment order (RDNA4)."""
+    torch.ops._rocm_C.moe_pack_bf16_rdna4(w)
+
+
+def moe_packed_gemm_bf16_rdna4(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    a_row_div: int,
+    num_slots: int,
+    glu: bool,
+) -> None:
+    torch.ops._rocm_C.moe_packed_gemm_bf16_rdna4(
+        a,
+        w,
+        out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        a_row_div,
+        num_slots,
+        glu,
+    )
+
+
 def moe_gptq_gemm_rdna3(
     a: torch.Tensor,
     c: torch.Tensor,

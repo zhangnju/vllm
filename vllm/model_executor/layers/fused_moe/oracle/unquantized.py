@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm._custom_ops as ops
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
@@ -38,6 +39,7 @@ class UnquantizedMoeBackend(Enum):
     FLASHINFER_TRTLLM = "FlashInfer TRTLLM"
     FLASHINFER_CUTLASS = "FlashInfer CUTLASS"
     AITER = "ROCm AITER"
+    RADEON = "RADEON"
     TRITON = "TRITON"
     BATCHED_TRITON = "BATCHED_TRITON"
     MOONEP = "MOONEP"
@@ -67,6 +69,8 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
             UnquantizedMoeBackend.TRITON,
             UnquantizedMoeBackend.BATCHED_TRITON,
         ]
+        if envs.VLLM_ROCM_RADEON_MOE:
+            _AVAILABLE_BACKENDS.insert(0, UnquantizedMoeBackend.RADEON)
     elif current_platform.is_cuda():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.FLASHINFER_TRTLLM,
@@ -141,6 +145,13 @@ def backend_to_kernel_cls(
         )
 
         return [AiterUnquantizedExperts]
+
+    elif backend == UnquantizedMoeBackend.RADEON:
+        from vllm.model_executor.layers.fused_moe.experts.radeon_moe import (
+            RadeonPackedExperts,
+        )
+
+        return [RadeonPackedExperts]
 
     elif backend == UnquantizedMoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
@@ -451,6 +462,14 @@ def convert_to_unquantized_kernel_format(
         )
         layer._moonep_weight_layout = layout
         return layout.full_gate_weight, layout.full_down_weight
+
+    if unquantized_backend == UnquantizedMoeBackend.RADEON:
+        # Re-lay the expert weights in place into the WMMA fragment order (same shape and size).
+        w13_weight = w13_weight.contiguous()
+        w2_weight = w2_weight.contiguous()
+        ops.moe_pack_bf16_rdna4(w13_weight)
+        ops.moe_pack_bf16_rdna4(w2_weight)
+        return w13_weight, w2_weight
 
     if unquantized_backend == UnquantizedMoeBackend.AITER:
         _zero_intermediate_padding(moe_config, w13_weight, w2_weight)

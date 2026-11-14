@@ -55,6 +55,16 @@ void moe_w4a8_decode_rdna3(
     const std::optional<at::Tensor>& w13_zp, const at::Tensor& w2,
     const at::Tensor& w2_scale, const std::optional<at::Tensor>& w2_zp);
 
+// Radeon packed-weight bf16 MoE GEMM for RDNA4 (gfx1200 / gfx1201).
+void moe_pack_bf16_rdna4(torch::Tensor w);
+void moe_packed_gemm_bf16_rdna4(torch::Tensor a, torch::Tensor w,
+                                torch::Tensor out,
+                                std::optional<torch::Tensor> topk_weights,
+                                torch::Tensor sorted_token_ids,
+                                torch::Tensor expert_ids,
+                                torch::Tensor num_tokens_post_padded,
+                                int64_t a_row_div, int64_t num_slots, bool glu);
+
 // RDNA3.5 decode and prefill attention: the fields of every build (none off
 // gfx1151), and a launch of one build by its index.
 std::vector<int64_t> rdna_decode_configs();

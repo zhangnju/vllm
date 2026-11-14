@@ -1830,6 +1830,14 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/moe_w4a8_decode_rdna3.cu")
   endif()
 
+  # Radeon packed-weight bf16 MoE GEMM (RDNA4: gfx1200 / gfx1201).
+  set(VLLM_ROCM_HAS_GFX12 OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx120[01]")
+    set(VLLM_ROCM_HAS_GFX12 ON)
+    list(APPEND VLLM_ROCM_EXT_SRC
+      "csrc/rocm/moe_packed_rdna4.cu")
+  endif()
+
   # RDNA3.5 attention kernels (gfx1151 only).
   set(VLLM_ROCM_HAS_RDNA_ATTN OFF)
   if("gfx1151" IN_LIST VLLM_GPU_ARCHES)
@@ -1875,6 +1883,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(VLLM_ROCM_HAS_GFX115X)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX115X)
+  endif()
+  if(VLLM_ROCM_HAS_GFX12)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX12)
   endif()
   if(VLLM_ROCM_HAS_RDNA_ATTN)
     target_link_libraries(_rocm_C PRIVATE _rocm_C_rdna_attn)

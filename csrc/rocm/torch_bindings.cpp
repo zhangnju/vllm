@@ -97,6 +97,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_w4a8_decode_rdna3", torch::kCUDA, &moe_w4a8_decode_rdna3);
 #endif
 
+#ifdef VLLM_ROCM_GFX12
+  // Radeon packed-weight bf16 MoE GEMM (RDNA4).
+  rocm_ops.def("moe_pack_bf16_rdna4(Tensor! w) -> ()");
+  rocm_ops.impl("moe_pack_bf16_rdna4", torch::kCUDA, &moe_pack_bf16_rdna4);
+  rocm_ops.def(
+      "moe_packed_gemm_bf16_rdna4(Tensor a, Tensor w, Tensor! out, "
+      "Tensor? topk_weights, Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, int a_row_div, int num_slots, "
+      "bool glu) -> ()");
+  rocm_ops.impl("moe_packed_gemm_bf16_rdna4", torch::kCUDA,
+                &moe_packed_gemm_bf16_rdna4);
+#endif
+
 #ifdef VLLM_ROCM_RDNA_ATTN
   // RDNA3.5 decode attention (gfx1151).
   rocm_ops.def("rdna_decode_configs() -> int[]", &rdna_decode_configs);
