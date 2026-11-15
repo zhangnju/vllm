@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+import vllm._custom_ops as ops
+
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -67,6 +69,7 @@ class Fp8MoeBackend(Enum):
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
     TRITON = "TRITON"
+    RADEON = "RADEON"
     BATCHED_TRITON = "BATCHED_TRITON"
     AITER = "AITER"
     VLLM_CUTLASS = "VLLM_CUTLASS"
@@ -99,6 +102,8 @@ def _get_priority_backends(
     This function can be extended to become more complex as needed.
     """
     _AVAILABLE_BACKENDS = [
+        # Radeon fp8-WMMA kernel (gfx1201, VLLM_ROCM_RADEON_MOE=1), gated by _supports_current_device().
+        Fp8MoeBackend.RADEON,
         Fp8MoeBackend.AITER,
         Fp8MoeBackend.FLASHINFER_TRTLLM,
         Fp8MoeBackend.FLASHINFER_CUTLASS,
@@ -216,6 +221,13 @@ def backend_to_kernel_cls(
         )
 
         return [MarlinExperts]
+
+    elif backend == Fp8MoeBackend.RADEON:
+        from vllm.model_executor.layers.fused_moe.experts.radeon_fp8_moe import (
+            RadeonFp8Experts,
+        )
+
+        return [RadeonFp8Experts]
 
     elif backend == Fp8MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
@@ -701,6 +713,17 @@ def convert_to_fp8_moe_kernel_format(
         w13, w13_scale, w2, w2_scale = prepare_fp8_w8a8_moe_layer_for_cpu(
             w13, w2, w13_scale, w2_scale
         )
+    elif fp8_backend == Fp8MoeBackend.RADEON:
+        # [E, R, K] e4m3 -> WMMA fragment order (same shape); block scales as contiguous f32
+        packed = []
+        for w in (w13, w2):
+            wu = w.contiguous().view(torch.uint8)
+            out = torch.empty_like(wu)
+            ops.moe_pack_fp8_rdna4(wu, out)
+            packed.append(out.view(w.dtype))
+        w13, w2 = packed
+        w13_scale = w13_scale.to(torch.float32).contiguous()
+        w2_scale = w2_scale.to(torch.float32).contiguous()
     else:
         if fp8_backend not in [
             Fp8MoeBackend.TRITON,

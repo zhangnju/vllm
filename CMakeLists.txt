@@ -1836,7 +1836,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     set(VLLM_ROCM_HAS_GFX12 ON)
     list(APPEND VLLM_ROCM_EXT_SRC
       "csrc/rocm/moe_packed_rdna4.cu"
-      "csrc/rocm/moe_w4a16_rdna4.cu")
+      "csrc/rocm/moe_w4a16_rdna4.cu"
+      "csrc/rocm/moe_fp8_rdna4.cu")
   endif()
 
   # RDNA3.5 attention kernels (gfx1151 only).

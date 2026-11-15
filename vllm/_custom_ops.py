@@ -728,6 +728,50 @@ def moe_pack_w4_rdna4(w_in: torch.Tensor, w_out: torch.Tensor) -> None:
     torch.ops._rocm_C.moe_pack_w4_rdna4(w_in, w_out)
 
 
+def moe_quant_x_fp8_rdna4(x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor) -> None:
+    torch.ops._rocm_C.moe_quant_x_fp8_rdna4(x, xq, xs)
+
+
+def moe_pack_fp8_rdna4(w_in: torch.Tensor, w_out: torch.Tensor) -> None:
+    torch.ops._rocm_C.moe_pack_fp8_rdna4(w_in, w_out)
+
+
+def moe_fp8_gemm_rdna4(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    ws: torch.Tensor,
+    out: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    a_row_div: int,
+    num_slots: int,
+    glu: bool,
+    oq: torch.Tensor | None = None,
+    ods: torch.Tensor | None = None,
+    nw: int = 8,
+) -> None:
+    torch.ops._rocm_C.moe_fp8_gemm_rdna4(
+        xq,
+        xs,
+        w,
+        ws,
+        out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        a_row_div,
+        num_slots,
+        glu,
+        oq,
+        ods,
+        nw,
+    )
+
+
 def moe_w4a16_gemm_rdna4(
     xq: torch.Tensor,
     xs: torch.Tensor,

@@ -122,6 +122,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor expert_ids, Tensor num_tokens_post_padded, int a_row_div, "
       "int num_slots, bool glu, Tensor!? oq, Tensor!? ods, Tensor!? osum, int nw) -> ()");
   rocm_ops.impl("moe_w4a16_gemm_rdna4", torch::kCUDA, &moe_w4a16_gemm_rdna4);
+  // Radeon FP8 MoE (RDNA4).
+  rocm_ops.def("moe_quant_x_fp8_rdna4(Tensor x, Tensor! xq, Tensor! xs) -> ()");
+  rocm_ops.impl("moe_quant_x_fp8_rdna4", torch::kCUDA, &moe_quant_x_fp8_rdna4);
+  rocm_ops.def("moe_pack_fp8_rdna4(Tensor w_in, Tensor! w_out) -> ()");
+  rocm_ops.impl("moe_pack_fp8_rdna4", torch::kCUDA, &moe_pack_fp8_rdna4);
+  rocm_ops.def(
+      "moe_fp8_gemm_rdna4(Tensor xq, Tensor xs, Tensor w, Tensor ws, "
+      "Tensor! out, Tensor? topk_weights, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_post_padded, int a_row_div, "
+      "int num_slots, bool glu, Tensor!? oq, Tensor!? ods, int nw) -> ()");
+  rocm_ops.impl("moe_fp8_gemm_rdna4", torch::kCUDA, &moe_fp8_gemm_rdna4);
 #endif
 
 #ifdef VLLM_ROCM_RDNA_ATTN

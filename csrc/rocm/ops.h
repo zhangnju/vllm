@@ -123,3 +123,16 @@ void rdna35_gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                         std::optional<torch::Tensor> initial_state,
                         torch::Tensor& cu_seqlens, torch::Tensor& out,
                         torch::Tensor& final_state, double scale);
+
+// Radeon block-scaled FP8 MoE GEMM for RDNA4.
+void moe_quant_x_fp8_rdna4(torch::Tensor x, torch::Tensor xq, torch::Tensor xs);
+void moe_pack_fp8_rdna4(torch::Tensor w_in, torch::Tensor w_out);
+void moe_fp8_gemm_rdna4(torch::Tensor xq, torch::Tensor xs, torch::Tensor w,
+                        torch::Tensor ws, torch::Tensor out,
+                        std::optional<torch::Tensor> topk_weights,
+                        torch::Tensor sorted_token_ids,
+                        torch::Tensor expert_ids,
+                        torch::Tensor num_tokens_post_padded,
+                        int64_t a_row_div, int64_t num_slots, bool glu,
+                        std::optional<torch::Tensor> oq,
+                        std::optional<torch::Tensor> ods, int64_t nw);
