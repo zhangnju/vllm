@@ -745,6 +745,7 @@ def moe_w4a16_gemm_rdna4(
     oq: torch.Tensor | None = None,
     ods: torch.Tensor | None = None,
     osum: torch.Tensor | None = None,
+    nw: int = 8,
 ) -> None:
     torch.ops._rocm_C.moe_w4a16_gemm_rdna4(
         xq,
@@ -763,6 +764,7 @@ def moe_w4a16_gemm_rdna4(
         oq,
         ods,
         osum,
+        nw,
     )
 
 

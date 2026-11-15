@@ -20,7 +20,7 @@
 namespace {
 
 [[maybe_unused]] constexpr int kBM = 16;   // slots per block row (one WMMA column tile)
-constexpr int kWarps = 8;                  // 8 warps x 16 output rows = 128 rows of W per block
+[[maybe_unused]] constexpr int kWarps = 8;                  // 8 warps x 16 output rows = 128 rows of W per block
 constexpr int kGroup = 128;                // K group = weight scale group = activation scale group
 
 typedef unsigned __attribute__((ext_vector_type(4))) v4u;
@@ -87,8 +87,8 @@ __global__ void pack_kernel(const uint8_t* __restrict__ w_in, uint8_t* __restric
   }
 }
 
-template <bool GLU>
-__global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
+template <bool GLU, int NW>
+__global__ __launch_bounds__(NW * 32) void moe_w4_kernel(
     const int8_t* __restrict__ xq, const float* __restrict__ xs, const int* __restrict__ xsum, int a_row_div,
     const uint8_t* __restrict__ wp, const uint16_t* __restrict__ wsc, int tiles_per_expert, int up_tile_off,
     uint16_t* __restrict__ out, const float* __restrict__ topk_w, const int* __restrict__ sorted_ids,
@@ -109,7 +109,7 @@ __global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
   const int8_t* xrow = xq + (size_t)arow * K + half8;
   const float* xsrow = xs + (size_t)arow * G;
   const int* xsumrow = xsum + (size_t)arow * G;
-  const int tile = min(pid_n * kWarps + warp, R / 16 - 1);
+  const int tile = min(pid_n * NW + warp, R / 16 - 1);
   const uint8_t* wb = wp + ((size_t)e * tiles_per_expert + tile) * G * 1024 + lane * 32;
   const uint8_t* wb2 = GLU ? wp + ((size_t)e * tiles_per_expert + tile + up_tile_off) * G * 1024 + lane * 32 : wb;
   const uint16_t* sb = wsc + ((size_t)e * tiles_per_expert + tile) * G * 16 + half8;
@@ -182,11 +182,11 @@ __global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
       }
     }
   }
-  const int n0 = pid_n * (kWarps * 16) + warp * 16 + half8;
+  const int n0 = pid_n * (NW * 16) + warp * 16 + half8;
   if (GLU && oq != nullptr) {
     // fused activation quantisation: this block's 128 output columns are exactly one K group of the next GEMM
-    __shared__ float smax[kWarps][16];
-    __shared__ int ssum[kWarps][16];
+    __shared__ float smax[NW][16];
+    __shared__ int ssum[NW][16];
     float v[8], amax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
@@ -198,7 +198,7 @@ __global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
     __syncthreads();
     float m = 0.0f;
 #pragma unroll
-    for (int w = 0; w < kWarps; ++w) m = fmaxf(m, smax[w][row]);
+    for (int w = 0; w < NW; ++w) m = fmaxf(m, smax[w][row]);
     const float d = m / 127.0f, inv = d > 0.0f ? 1.0f / d : 0.0f;
     unsigned pk[2] = {0u, 0u};
     int sum = 0;
@@ -215,7 +215,7 @@ __global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
     if (warp == 0 && lane < 16 && valid) {
       int tot = 0;
 #pragma unroll
-      for (int w = 0; w < kWarps; ++w) tot += ssum[w][row];
+      for (int w = 0; w < NW; ++w) tot += ssum[w][row];
       ods[(size_t)s * (R / kGroup) + pid_n] = d;
       osum[(size_t)s * (R / kGroup) + pid_n] = tot;
     }
@@ -267,7 +267,7 @@ void moe_w4a16_gemm_rdna4(torch::Tensor xq, torch::Tensor xs, torch::Tensor xsum
                           torch::Tensor out, std::optional<torch::Tensor> topk_weights, torch::Tensor sorted_token_ids,
                           torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded, int64_t a_row_div,
                           int64_t num_slots, bool glu, std::optional<torch::Tensor> oq, std::optional<torch::Tensor> ods,
-                          std::optional<torch::Tensor> osum) {
+                          std::optional<torch::Tensor> osum, int64_t nw) {
   TORCH_CHECK(out.scalar_type() == at::kBFloat16 && ws.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kByte, "dtypes");
   const int64_t Rtot = w.size(1), K = w.size(2) * 2;
   const int64_t R = glu ? Rtot / 2 : Rtot;
@@ -279,13 +279,16 @@ void moe_w4a16_gemm_rdna4(torch::Tensor xq, torch::Tensor xs, torch::Tensor xsum
   const at::cuda::OptionalCUDAGuard guard(device_of(xq));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int m_blocks = (int)expert_ids.size(0);
-  const int num_pid_n = (int)((R + kWarps * 16 - 1) / (kWarps * 16));
-  const dim3 grid((unsigned)(m_blocks * num_pid_n)), block(kWarps * 32);
+  TORCH_CHECK(nw == 8 || nw == 4 || nw == 2 || nw == 1, "nw must be 1, 2, 4 or 8");
+  TORCH_CHECK(!fuse_q || nw == 8, "fused quant needs nw == 8");
+  const int num_pid_n = (int)((R + nw * 16 - 1) / (nw * 16));
+  const dim3 grid((unsigned)(m_blocks * num_pid_n)), block((unsigned)(nw * 32));
   const float* tw = topk_weights.has_value() ? (const float*)topk_weights->data_ptr() : nullptr;
   const int tiles = (int)(Rtot / 16);
-  auto launch = [&](auto glu_tag) {
+  auto launch = [&](auto glu_tag, auto nw_tag) {
     constexpr bool GLU = decltype(glu_tag)::value;
-    moe_w4_kernel<GLU><<<grid, block, 0, stream>>>(
+    constexpr int NW = decltype(nw_tag)::value;
+    moe_w4_kernel<GLU, NW><<<grid, block, 0, stream>>>(
         (const int8_t*)xq.data_ptr(), (const float*)xs.data_ptr(), (const int*)xsum.data_ptr(), (int)a_row_div,
         (const uint8_t*)w.data_ptr(), (const uint16_t*)ws.data_ptr(), tiles, GLU ? (int)(R / 16) : 0,
         (uint16_t*)out.data_ptr(), tw, (const int*)sorted_token_ids.data_ptr(), (const int*)expert_ids.data_ptr(),
@@ -293,6 +296,17 @@ void moe_w4a16_gemm_rdna4(torch::Tensor xq, torch::Tensor xs, torch::Tensor xsum
         fuse_q ? (int8_t*)oq->data_ptr() : nullptr, fuse_q ? (float*)ods->data_ptr() : nullptr,
         fuse_q ? (int*)osum->data_ptr() : nullptr);
   };
-  if (glu) launch(std::true_type{}); else launch(std::false_type{});
+  using std::integral_constant;
+  if (glu) {
+    TORCH_CHECK(nw == 8 || nw == 4 || nw == 2, "glu supports nw 8, 4, 2");
+    if (nw == 8) launch(std::true_type{}, integral_constant<int, 8>{});
+    else if (nw == 4) launch(std::true_type{}, integral_constant<int, 4>{});
+    else launch(std::true_type{}, integral_constant<int, 2>{});
+  } else {
+    if (nw == 8) launch(std::false_type{}, integral_constant<int, 8>{});
+    else if (nw == 4) launch(std::false_type{}, integral_constant<int, 4>{});
+    else if (nw == 2) launch(std::false_type{}, integral_constant<int, 2>{});
+    else launch(std::false_type{}, integral_constant<int, 1>{});
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

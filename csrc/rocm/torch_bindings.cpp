@@ -120,7 +120,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "moe_w4a16_gemm_rdna4(Tensor xq, Tensor xs, Tensor xsum, Tensor w, "
       "Tensor ws, Tensor! out, Tensor? topk_weights, Tensor sorted_token_ids, "
       "Tensor expert_ids, Tensor num_tokens_post_padded, int a_row_div, "
-      "int num_slots, bool glu, Tensor!? oq, Tensor!? ods, Tensor!? osum) -> ()");
+      "int num_slots, bool glu, Tensor!? oq, Tensor!? ods, Tensor!? osum, int nw) -> ()");
   rocm_ops.impl("moe_w4a16_gemm_rdna4", torch::kCUDA, &moe_w4a16_gemm_rdna4);
 #endif
 

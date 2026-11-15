@@ -79,7 +79,7 @@ void moe_w4a16_gemm_rdna4(torch::Tensor xq, torch::Tensor xs,
                           int64_t a_row_div, int64_t num_slots, bool glu,
                           std::optional<torch::Tensor> oq,
                           std::optional<torch::Tensor> ods,
-                          std::optional<torch::Tensor> osum);
+                          std::optional<torch::Tensor> osum, int64_t nw);
 
 // RDNA3.5 decode and prefill attention: the fields of every build (none off
 // gfx1151), and a launch of one build by its index.
