@@ -988,6 +988,9 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         w_q, w_s, w_zp = self._get_weight_params(layer)
+        if not c.zero_points:
+            # symmetric GPTQ checkpoints still carry a (constant) qzeros tensor; the kernel uses the scalar bias instead
+            w_zp = None
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
