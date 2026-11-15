@@ -166,10 +166,13 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _BLOCK, global_num_experts, None)
         xq, xs, xsum = self._quant(hidden_states)
         act = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)
+        # GEMM 1 writes the int8 activation (+ per-128 scales and sums) straight from its epilogue
+        aq = torch.empty(num_slots, inter, dtype=torch.int8, device=hidden_states.device)
+        a_s = torch.empty(num_slots, inter // _GROUP, dtype=torch.float32, device=hidden_states.device)
+        a_sum = torch.empty(num_slots, inter // _GROUP, dtype=torch.int32, device=hidden_states.device)
         ops.moe_w4a16_gemm_rdna4(
-            xq, xs, xsum, w1, self.w1_scale, act, None, sorted_ids, expert_ids, num_post, top_k, num_slots, True
+            xq, xs, xsum, w1, self.w1_scale, act, None, sorted_ids, expert_ids, num_post, top_k, num_slots, True, aq, a_s, a_sum
         )
-        aq, a_s, a_sum = self._quant(act)
         down = workspace2.view(-1)[: num_slots * K].view(num_slots, K)
         tw = topk_weights.reshape(-1).to(torch.float32).contiguous()
         ops.moe_w4a16_gemm_rdna4(

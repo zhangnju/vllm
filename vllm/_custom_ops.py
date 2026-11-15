@@ -742,6 +742,9 @@ def moe_w4a16_gemm_rdna4(
     a_row_div: int,
     num_slots: int,
     glu: bool,
+    oq: torch.Tensor | None = None,
+    ods: torch.Tensor | None = None,
+    osum: torch.Tensor | None = None,
 ) -> None:
     torch.ops._rocm_C.moe_w4a16_gemm_rdna4(
         xq,
@@ -757,6 +760,9 @@ def moe_w4a16_gemm_rdna4(
         a_row_div,
         num_slots,
         glu,
+        oq,
+        ods,
+        osum,
     )
 
 

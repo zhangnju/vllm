@@ -92,7 +92,8 @@ __global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
     const int8_t* __restrict__ xq, const float* __restrict__ xs, const int* __restrict__ xsum, int a_row_div,
     const uint8_t* __restrict__ wp, const uint16_t* __restrict__ wsc, int tiles_per_expert, int up_tile_off,
     uint16_t* __restrict__ out, const float* __restrict__ topk_w, const int* __restrict__ sorted_ids,
-    const int* __restrict__ expert_ids, const int* __restrict__ ntpp, int R, int K, int num_slots, int num_pid_n) {
+    const int* __restrict__ expert_ids, const int* __restrict__ ntpp, int R, int K, int num_slots, int num_pid_n,
+    int8_t* __restrict__ oq, float* __restrict__ ods, int* __restrict__ osum) {
 #if defined(__gfx1201__) || defined(__gfx1200__)
   const int pid = blockIdx.x, pid_m = pid / num_pid_n, pid_n = pid % num_pid_n;
   if (pid_m * kBM >= *ntpp) return;
@@ -182,6 +183,44 @@ __global__ __launch_bounds__(kWarps * 32) void moe_w4_kernel(
     }
   }
   const int n0 = pid_n * (kWarps * 16) + warp * 16 + half8;
+  if (GLU && oq != nullptr) {
+    // fused activation quantisation: this block's 128 output columns are exactly one K group of the next GEMM
+    __shared__ float smax[kWarps][16];
+    __shared__ int ssum[kWarps][16];
+    float v[8], amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      v[j] = bf16_bits_to_f32(f32_to_bf16_bits(acc[j] / (1.0f + __expf(-acc[j])) * acc2[j]));
+      amax = fmaxf(amax, fabsf(v[j]));
+    }
+    amax = fmaxf(amax, __shfl_xor(amax, 16));
+    if (lane < 16) smax[warp][row] = amax;
+    __syncthreads();
+    float m = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) m = fmaxf(m, smax[w][row]);
+    const float d = m / 127.0f, inv = d > 0.0f ? 1.0f / d : 0.0f;
+    unsigned pk[2] = {0u, 0u};
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int q = __float2int_rn(v[j] * inv);
+      sum += q;
+      pk[j >> 2] |= (unsigned)(q & 0xff) << (8 * (j & 3));
+    }
+    sum += __shfl_xor(sum, 16);
+    if (lane < 16) ssum[warp][row] = sum;
+    if (valid) *(uint2*)(oq + (size_t)s * R + n0) = make_uint2(pk[0], pk[1]);
+    __syncthreads();
+    if (warp == 0 && lane < 16 && valid) {
+      int tot = 0;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) tot += ssum[w][row];
+      ods[(size_t)s * (R / kGroup) + pid_n] = d;
+      osum[(size_t)s * (R / kGroup) + pid_n] = tot;
+    }
+    return;
+  }
   if (valid && n0 < R) {
     const float rw = topk_w ? topk_w[s] : 1.0f;
     unsigned r[4];
@@ -227,11 +266,14 @@ void moe_pack_w4_rdna4(torch::Tensor w_in, torch::Tensor w_out) {
 void moe_w4a16_gemm_rdna4(torch::Tensor xq, torch::Tensor xs, torch::Tensor xsum, torch::Tensor w, torch::Tensor ws,
                           torch::Tensor out, std::optional<torch::Tensor> topk_weights, torch::Tensor sorted_token_ids,
                           torch::Tensor expert_ids, torch::Tensor num_tokens_post_padded, int64_t a_row_div,
-                          int64_t num_slots, bool glu) {
+                          int64_t num_slots, bool glu, std::optional<torch::Tensor> oq, std::optional<torch::Tensor> ods,
+                          std::optional<torch::Tensor> osum) {
   TORCH_CHECK(out.scalar_type() == at::kBFloat16 && ws.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kByte, "dtypes");
   const int64_t Rtot = w.size(1), K = w.size(2) * 2;
   const int64_t R = glu ? Rtot / 2 : Rtot;
   TORCH_CHECK(xq.size(1) == K && out.size(1) == R && out.size(0) >= num_slots, "shape mismatch");
+  const bool fuse_q = oq.has_value();
+  TORCH_CHECK(!fuse_q || (glu && R % kGroup == 0 && ods.has_value() && osum.has_value()), "fused quant needs glu, R % 128 == 0");
   TORCH_CHECK(R % 16 == 0 && K % kGroup == 0 && R % 8 == 0, "need R % 16 == 0 and K % 128 == 0");
   TORCH_CHECK(ws.dim() == 4 && ws.size(1) == Rtot / 16 && ws.size(2) == K / kGroup && ws.size(3) == 16, "scale layout");
   const at::cuda::OptionalCUDAGuard guard(device_of(xq));
@@ -247,7 +289,9 @@ void moe_w4a16_gemm_rdna4(torch::Tensor xq, torch::Tensor xs, torch::Tensor xsum
         (const int8_t*)xq.data_ptr(), (const float*)xs.data_ptr(), (const int*)xsum.data_ptr(), (int)a_row_div,
         (const uint8_t*)w.data_ptr(), (const uint16_t*)ws.data_ptr(), tiles, GLU ? (int)(R / 16) : 0,
         (uint16_t*)out.data_ptr(), tw, (const int*)sorted_token_ids.data_ptr(), (const int*)expert_ids.data_ptr(),
-        (const int*)num_tokens_post_padded.data_ptr(), (int)R, (int)K, (int)num_slots, num_pid_n);
+        (const int*)num_tokens_post_padded.data_ptr(), (int)R, (int)K, (int)num_slots, num_pid_n,
+        fuse_q ? (int8_t*)oq->data_ptr() : nullptr, fuse_q ? (float*)ods->data_ptr() : nullptr,
+        fuse_q ? (int*)osum->data_ptr() : nullptr);
   };
   if (glu) launch(std::true_type{}); else launch(std::false_type{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
