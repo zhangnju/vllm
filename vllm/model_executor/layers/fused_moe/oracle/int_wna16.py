@@ -88,6 +88,7 @@ class WNA16MoEBackend(Enum):
     RDNA3_INT4_INT8 = "RDNA3_INT4_INT8"
     # No compute backend: requantization sources only dequantize weights.
     NONE = "NONE"
+    RADEON = "RADEON"
 
 
 def backend_to_kernel_cls(
@@ -150,6 +151,12 @@ def backend_to_kernel_cls(
         )
 
         return [Rdna3Int4Int8Experts]
+    elif backend == WNA16MoEBackend.RADEON:
+        from vllm.model_executor.layers.fused_moe.experts.radeon_w4a16_moe import (
+            RadeonW4A16Experts,
+        )
+
+        return [RadeonW4A16Experts]
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -162,6 +169,8 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         return [WNA16MoEBackend.XPU]
 
     backends = [
+        # Radeon int8-WMMA kernel (gfx1201, VLLM_ROCM_RADEON_MOE=1), gated by _supports_current_device().
+        WNA16MoEBackend.RADEON,
         # Native HIP kernels, gated on gfx11 / gfx1100 by
         # _supports_current_device(). RDNA3_INT4_INT8 is only tried for a
         # kInt8Dynamic32Sym activation request (see _filter_by_activation).
@@ -207,6 +216,18 @@ def _backend_incompatibility_reason(
 ) -> str | None:
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
+
+    if backend == WNA16MoEBackend.RADEON:
+        if may_have_zp:
+            return "asymmetric checkpoints are not supported"
+        if may_have_bias:
+            return "expert bias is not supported"
+        if getattr(quant_config, "group_size", None) != 128:
+            return "group size 128 only"
+        if getattr(quant_config, "desc_act", False) or getattr(quant_config, "actorder", None) == "group":
+            return "activation ordering is not supported"
+        if getattr(quant_config, "weight_bits", 4) != 4 and getattr(quant_config, "num_bits", 4) != 4:
+            return "4-bit weights only"
 
     if backend == WNA16MoEBackend.RDNA3:
         if not isinstance(quant_config, QuantizationArgs):
@@ -530,6 +551,9 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.rdna3_int4_int8_moe import (
         Rdna3Int4Int8Experts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.radeon_w4a16_moe import (
+        RadeonW4A16Experts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.rdna3_moe import (
         Rdna3WNA16Experts,
     )
@@ -555,6 +579,7 @@ def make_wna16_moe_kernel(
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
         Rdna3Int4Int8Experts,
+        RadeonW4A16Experts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
@@ -1686,6 +1711,22 @@ def convert_to_wna16_moe_kernel_format(
                 w13_bias,
                 w2_bias,
             )
+    elif backend == WNA16MoEBackend.RADEON:
+        # Canonical N-first [E, R, K/8] int32 -> uint8 [E, R, K/2], re-laid in the WMMA fragment order;
+        # scales [E, R, G] -> [E, R/16, G, 16] (rows of a tile contiguous per group). Symmetric (zero point 8).
+        packed = []
+        for w in (w13, w2):
+            wu = w.contiguous().view(torch.uint8)
+            out = torch.empty_like(wu)
+            ops.moe_pack_w4_rdna4(wu, out)
+            packed.append(out)
+
+        def _scales(sc: torch.Tensor) -> torch.Tensor:
+            E_, R_, G_ = sc.shape
+            return sc.to(torch.bfloat16).reshape(E_, R_ // 16, 16, G_).permute(0, 1, 3, 2).contiguous()
+
+        return (packed[0], packed[1], _scales(w13_scale), _scales(w2_scale), None, None, None, None)
+
     elif backend == WNA16MoEBackend.RDNA3:
         assert isinstance(quant_config, QuantizationArgs)
         return _process_weights_rdna3(

@@ -720,6 +720,46 @@ def moe_packed_gemm_bf16_rdna4(
     )
 
 
+def moe_quant_x_g128_rdna4(x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor, xsum: torch.Tensor) -> None:
+    torch.ops._rocm_C.moe_quant_x_g128_rdna4(x, xq, xs, xsum)
+
+
+def moe_pack_w4_rdna4(w_in: torch.Tensor, w_out: torch.Tensor) -> None:
+    torch.ops._rocm_C.moe_pack_w4_rdna4(w_in, w_out)
+
+
+def moe_w4a16_gemm_rdna4(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    xsum: torch.Tensor,
+    w: torch.Tensor,
+    ws: torch.Tensor,
+    out: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    a_row_div: int,
+    num_slots: int,
+    glu: bool,
+) -> None:
+    torch.ops._rocm_C.moe_w4a16_gemm_rdna4(
+        xq,
+        xs,
+        xsum,
+        w,
+        ws,
+        out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        a_row_div,
+        num_slots,
+        glu,
+    )
+
+
 def moe_gptq_gemm_rdna3(
     a: torch.Tensor,
     c: torch.Tensor,
