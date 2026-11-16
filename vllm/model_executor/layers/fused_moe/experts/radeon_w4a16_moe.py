@@ -14,6 +14,7 @@ intermediate sizes that are multiples of 128, gated SiLU, no expert parallelism.
 import torch
 
 import vllm._custom_ops as ops
+from vllm.model_executor.layers.fused_moe.experts import radeon_rq
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -40,6 +41,12 @@ def radeon_w4a16_kernel_available() -> bool:
         return False
     from vllm.platforms.rocm import on_gfx1201
 
+    if radeon_rq.enabled():
+        try:
+            radeon_rq.rq_ops()
+        except Exception:
+            return False
+        return on_gfx1201()
     return (
         on_gfx1201()
         and hasattr(torch.ops, "_rocm_C")
@@ -164,6 +171,9 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         num_slots = M * top_k
 
         sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _BLOCK, global_num_experts, None)
+        if radeon_rq.enabled():
+            self._apply_rq(output, hidden_states, w1, w2, topk_weights, sorted_ids, expert_ids, num_post, inter, K, top_k, M, num_slots, workspace13, workspace2)
+            return
         xq, xs, xsum = self._quant(hidden_states)
         act = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)
         # GEMM 1 writes the int8 activation (+ per-128 scales and sums) straight from its epilogue
@@ -178,4 +188,22 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         ops.moe_w4a16_gemm_rdna4(
             aq, a_s, a_sum, w2, self.w2_scale, down, tw, sorted_ids, expert_ids, num_post, 1, num_slots, False
         )
+        ops.moe_sum(down.view(M, top_k, K), output)
+
+    def _apply_rq(self, output, hidden_states, w1, w2, topk_weights, sorted_ids, expert_ids, num_post, inter, K, top_k, M, num_slots, workspace13, workspace2):
+        """Same pipeline on the rq core: quantise x, GEMM 1 (gate/up/SiLU + fused activation quantisation), GEMM 2 (router weight), sum over top-k."""
+        rq = radeon_rq.rq_ops()
+        act = radeon_rq.act_id()
+        dev = hidden_states.device
+        xq, xs, xsum = rq.quant_x(hidden_states, act)
+        aq = torch.empty(num_slots, inter * radeon_rq.act_bits(act) // 8, dtype=torch.uint8, device=dev)
+        a_s = torch.empty(num_slots, inter // _GROUP, dtype=torch.float32, device=dev)
+        a_sum = torch.empty(num_slots, inter // _GROUP, dtype=radeon_rq.act_sum_dtype(act), device=dev)
+        act_out = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)   # shape donor only (the fused epilogue writes aq)
+        rq.gemm(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_out, None, sorted_ids, expert_ids, num_post,
+                top_k, num_slots, radeon_rq.EPI_GLUQ, aq, a_s, a_sum, 8, act)
+        down = workspace2.view(-1)[: num_slots * K].view(num_slots, K)
+        tw = topk_weights.reshape(-1).to(torch.float32).contiguous()
+        rq.gemm(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sorted_ids, expert_ids, num_post, 1, num_slots, radeon_rq.EPI_PLAIN, None,
+                None, None, 8, act)
         ops.moe_sum(down.view(M, top_k, K), output)

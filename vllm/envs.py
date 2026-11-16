@@ -152,6 +152,8 @@ if TYPE_CHECKING:
     VLLM_FP8_MOE_REQUANT_ACT: Literal["a8w4", "a4w4", "a16w4"] = "a8w4"
     VLLM_ROCM_RADEON_MOE: bool = False
     VLLM_ROCM_RADEON_LINEAR: bool = False
+    VLLM_ROCM_RADEON_RQ: bool = False
+    VLLM_ROCM_RADEON_ACT: str = "int8"
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4: bool | None = None
     VLLM_ROCM_USE_AITER_MOE_SITUV2: Literal["auto", "a4w4", "a8w4", "a16w4"] = "auto"
@@ -1394,6 +1396,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_RADEON_LINEAR": lambda: (
         os.getenv("VLLM_ROCM_RADEON_LINEAR", "False").lower() in ("true", "1")
     ),
+    "VLLM_ROCM_RADEON_RQ": lambda: (os.getenv("VLLM_ROCM_RADEON_RQ", "False").lower() in ("true", "1")),
+    "VLLM_ROCM_RADEON_ACT": lambda: os.getenv("VLLM_ROCM_RADEON_ACT", "int8"),
     # Activation dtype for the Kimi-K3 SiTU MXFP4 MoE (AITER FlyDSL SiTUv2):
     # auto (= a4w4), a4w4, a8w4 or a16w4. Legacy 1/0 mean a4w4/a16w4.
     "VLLM_ROCM_USE_AITER_MOE_SITUV2": env_with_choices(

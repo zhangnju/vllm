@@ -1717,8 +1717,13 @@ def convert_to_wna16_moe_kernel_format(
         packed = []
         for w in (w13, w2):
             wu = w.contiguous().view(torch.uint8)
-            out = torch.empty_like(wu)
-            ops.moe_pack_w4_rdna4(wu, out)
+            from vllm.model_executor.layers.fused_moe.experts import radeon_rq
+
+            if radeon_rq.enabled():
+                out = radeon_rq.rq_ops().pack_w4(wu, radeon_rq.act_id())
+            else:
+                out = torch.empty_like(wu)
+                ops.moe_pack_w4_rdna4(wu, out)
             packed.append(out)
 
         def _scales(sc: torch.Tensor) -> torch.Tensor:

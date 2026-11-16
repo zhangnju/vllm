@@ -13,6 +13,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.envs as envs
+from vllm.model_executor.layers.fused_moe.experts import radeon_rq
 from vllm.model_executor.parameter import permute_param_layout_
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -31,6 +32,12 @@ def _radeon_available() -> bool:
         return False
     from vllm.platforms.rocm import on_gfx1201
 
+    if radeon_rq.enabled():
+        try:
+            radeon_rq.rq_ops()
+        except Exception:
+            return False
+        return on_gfx1201()
     return (
         on_gfx1201()
         and hasattr(torch.ops, "_rocm_C")
@@ -62,6 +69,13 @@ def _radeon_w4a16_gemm_impl(
         return _triton_w4a16_gemm_impl(a, b_q, scales, None, group_size, 8)
     N = w.size(1)
     mb = (M + 15) // 16
+    if radeon_rq.enabled():
+        rq = radeon_rq.rq_ops()
+        act = radeon_rq.act_id()
+        xq, xs, xsum = rq.quant_x(a, act)
+        out = torch.empty(M, N, dtype=a.dtype, device=a.device)
+        rq.gemm(xq, xs, xsum, w, ws, out, None, ids, eids[:mb], ntpp[mb - 1 : mb], 1, M, radeon_rq.EPI_PLAIN, None, None, None, _pick_nw(N, mb), act)
+        return out
     xq = torch.empty(M, K, dtype=torch.int8, device=a.device)
     xs = torch.empty(M, K // _GROUP, dtype=torch.float32, device=a.device)
     xsum = torch.empty(M, K // _GROUP, dtype=torch.int32, device=a.device)
@@ -115,7 +129,10 @@ class RadeonW4A16LinearKernel(TritonW4A16LinearKernel):
         permute_param_layout_(w_s, input_dim=1, output_dim=0)
         w = w_q.data.contiguous().view(torch.uint8).unsqueeze(0)  # [1, N, K/2]
         packed = torch.empty_like(w)
-        ops.moe_pack_w4_rdna4(w, packed)
+        if radeon_rq.enabled():
+            packed = radeon_rq.rq_ops().pack_w4(w, radeon_rq.act_id())
+        else:
+            ops.moe_pack_w4_rdna4(w, packed)
         n, g = w_s.data.shape
         s = w_s.data.to(torch.bfloat16).reshape(n // 16, 16, g).permute(0, 2, 1).contiguous().unsqueeze(0)
         layer.register_buffer("radeon_w4_w", packed, persistent=False)
