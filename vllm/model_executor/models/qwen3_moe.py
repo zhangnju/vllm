@@ -48,6 +48,11 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.layernorm import RMSNorm
+import os as _os
+
+if _os.environ.get("VLLM_ROCM_RADEON_TPCOMM", "0").lower() in ("1", "true"):
+    from radeon_ops.comm import vllm_tp as _rqc_tp  # noqa: F401  (registers torch.ops.rqcv.tp_add_rms)
+
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -84,6 +89,12 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _tpcomm_on() -> bool:
+    """VLLM_ROCM_RADEON_TPCOMM=1: row-parallel outputs stay partial and the next RMSNorm is fused with the all-reduce (radeon_ops.comm, 2 or 4 ranks)."""
+    import os
+    return os.environ.get("VLLM_ROCM_RADEON_TPCOMM", "0").lower() in ("1", "true") and get_tensor_model_parallel_world_size() in (2, 4)
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -220,6 +231,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
             is_fused_checkpoint_transposed=is_fused_checkpoint_transposed,
+            **({"reduce_results": False} if _tpcomm_on() else {}),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -300,6 +312,7 @@ class Qwen3MoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not _tpcomm_on(),
             prefix=f"{prefix}.o_proj",
         )
 
@@ -406,6 +419,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if _tpcomm_on():
+            # hidden_states arrives (and leaves) as this rank's PARTIAL sum; the all-reduce is fused into the following add + RMSNorm
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = torch.ops.rqcv.tp_add_rms(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.variance_epsilon)
+            hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            hidden_states, residual = torch.ops.rqcv.tp_add_rms(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon)
+            hidden_states = self.mlp(hidden_states)
+            return hidden_states, residual
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -469,6 +493,10 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if _tpcomm_on():
+            from radeon_ops.comm.vllm_tp import init_tp_comm
+
+            init_tp_comm()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -510,7 +538,10 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if _tpcomm_on():
+            hidden_states, _ = torch.ops.rqcv.tp_add_rms(hidden_states, residual, self.norm.weight, self.norm.variance_epsilon)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         # Return auxiliary hidden states if collected
         if len(aux_hidden_states) > 0:
