@@ -28,6 +28,16 @@ def prequant_take(a: torch.Tensor):
     return prequant.take(a)
 
 
+# VLLM_ROCM_RADEON_BIG=1: dense W4A16 layers with M >= VLLM_ROCM_RADEON_BIG_MIN_M (default 512) run the LDS large-M rq kernel (rq.gemm_big, int8 activations);
+# =2 additionally runs 64 < M < MIN_M on the streaming rq kernel instead of Triton.  Needs VLLM_ROCM_RADEON_RQ=1 (act int8).
+_BIG = int(os.environ.get("VLLM_ROCM_RADEON_BIG", "0") or 0) if os.environ.get("VLLM_ROCM_RADEON_BIG", "0") not in ("true", "True") else 1
+BIG_MIN_M = int(os.environ.get("VLLM_ROCM_RADEON_BIG_MIN_M", "512"))   # radeon_big
+
+
+def big_mode() -> int:
+    return _BIG
+
+
 def enabled() -> bool:
     return bool(envs.VLLM_ROCM_RADEON_RQ)
 

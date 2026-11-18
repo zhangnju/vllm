@@ -65,9 +65,30 @@ def _radeon_w4a16_gemm_impl(
     group_size: int,
 ) -> torch.Tensor:
     M, K = a.shape
+    N = w.size(1)
+    if M > MAX_M and radeon_rq.big_mode() and radeon_rq.enabled() and radeon_rq.act_id() == 0 and K % 128 == 0 and N % 16 == 0:
+        rq = radeon_rq.rq_ops()
+        if M >= radeon_rq.BIG_MIN_M:      # radeon_big: activations staged in LDS, 128-slot blocks of the single expert
+            bm = 128
+            nbl = (M + bm - 1) // bm
+            sorted_ids = torch.arange(nbl * bm, dtype=torch.int32, device=a.device)   # ids >= M are the padding (invalid slots)
+            eids = torch.zeros(nbl, dtype=torch.int32, device=a.device)
+            ntpp = torch.full((1,), nbl * bm, dtype=torch.int32, device=a.device)
+            xq, xs, xsum = rq.quant_x(a, 0)
+            out = torch.empty(M, N, dtype=a.dtype, device=a.device)
+            rq.gemm_big(xq, xs, xsum, w, ws, out, None, sorted_ids, eids, ntpp, 1, M, 0)
+            return out
+        if radeon_rq.big_mode() >= 2:      # mid sizes: the streaming rq kernel with 16-slot blocks
+            mb = (M + 15) // 16
+            sorted_ids = torch.arange(mb * 16, dtype=torch.int32, device=a.device)
+            eids = torch.zeros(mb, dtype=torch.int32, device=a.device)
+            ntpp = torch.full((1,), mb * 16, dtype=torch.int32, device=a.device)
+            xq, xs, xsum = rq.quant_x(a, 0)
+            out = torch.empty(M, N, dtype=a.dtype, device=a.device)
+            rq.gemm(xq, xs, xsum, w, ws, out, None, sorted_ids, eids, ntpp, 1, M, radeon_rq.EPI_PLAIN, None, None, None, _pick_nw(N, mb), 0)
+            return out
     if M > MAX_M:
         return _triton_w4a16_gemm_impl(a, b_q, scales, None, group_size, 8)
-    N = w.size(1)
     mb = (M + 15) // 16
     if radeon_rq.enabled():
         rq = radeon_rq.rq_ops()
