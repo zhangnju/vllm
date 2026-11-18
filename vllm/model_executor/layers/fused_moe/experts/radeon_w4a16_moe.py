@@ -134,6 +134,9 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _quant(x: torch.Tensor):
+        pq = radeon_rq.prequant_take(x)
+        if pq is not None:
+            return pq[0].view(torch.int8), pq[1], pq[2]
         rows, K = x.shape
         xq = torch.empty(rows, K, dtype=torch.int8, device=x.device)
         xs = torch.empty(rows, K // _GROUP, dtype=torch.float32, device=x.device)
@@ -195,7 +198,8 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         rq = radeon_rq.rq_ops()
         act = radeon_rq.act_id()
         dev = hidden_states.device
-        xq, xs, xsum = rq.quant_x(hidden_states, act)
+        pq = radeon_rq.prequant_take(hidden_states) if act == 0 else None   # int8 activation: produced by the fused all-reduce + RMSNorm
+        xq, xs, xsum = pq if pq is not None else rq.quant_x(hidden_states, act)
         aq = torch.empty(num_slots, inter * radeon_rq.act_bits(act) // 8, dtype=torch.uint8, device=dev)
         a_s = torch.empty(num_slots, inter // _GROUP, dtype=torch.float32, device=dev)
         a_sum = torch.empty(num_slots, inter // _GROUP, dtype=radeon_rq.act_sum_dtype(act), device=dev)

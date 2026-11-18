@@ -6,6 +6,7 @@ VLLM_ROCM_RADEON_RQ=1 routes the RADEON W4A16 MoE and dense kernels through rq i
 activation path: bit-exact); VLLM_ROCM_RADEON_ACT = int8 (default) | fp8 | int4 selects the activation format / WMMA atom.
 """
 import functools
+import os
 
 import torch
 
@@ -13,6 +14,18 @@ import vllm.envs as envs
 
 ACT_IDS = {"int8": 0, "fp8": 1, "int4": 2}
 EPI_PLAIN, EPI_GLU, EPI_GLUQ = 0, 1, 2
+
+
+_PREQUANT = os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() in ("1", "true")
+
+
+def prequant_take(a: torch.Tensor):
+    """(xq uint8, xs f32, xsum i32) if the fused all-reduce + RMSNorm just produced `a` together with its int8 group-128 quantisation, else None (radeon_ops.comm.prequant)."""
+    if not _PREQUANT:
+        return None
+    from radeon_ops.comm import prequant
+
+    return prequant.take(a)
 
 
 def enabled() -> bool:

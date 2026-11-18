@@ -72,14 +72,19 @@ def _radeon_w4a16_gemm_impl(
     if radeon_rq.enabled():
         rq = radeon_rq.rq_ops()
         act = radeon_rq.act_id()
-        xq, xs, xsum = rq.quant_x(a, act)
+        pq = radeon_rq.prequant_take(a) if act == 0 else None
+        xq, xs, xsum = pq if pq is not None else rq.quant_x(a, act)
         out = torch.empty(M, N, dtype=a.dtype, device=a.device)
         rq.gemm(xq, xs, xsum, w, ws, out, None, ids, eids[:mb], ntpp[mb - 1 : mb], 1, M, radeon_rq.EPI_PLAIN, None, None, None, _pick_nw(N, mb), act)
         return out
-    xq = torch.empty(M, K, dtype=torch.int8, device=a.device)
-    xs = torch.empty(M, K // _GROUP, dtype=torch.float32, device=a.device)
-    xsum = torch.empty(M, K // _GROUP, dtype=torch.int32, device=a.device)
-    ops.moe_quant_x_g128_rdna4(a, xq, xs, xsum)
+    pq = radeon_rq.prequant_take(a)
+    if pq is not None:
+        xq, xs, xsum = pq[0].view(torch.int8), pq[1], pq[2]
+    else:
+        xq = torch.empty(M, K, dtype=torch.int8, device=a.device)
+        xs = torch.empty(M, K // _GROUP, dtype=torch.float32, device=a.device)
+        xsum = torch.empty(M, K // _GROUP, dtype=torch.int32, device=a.device)
+        ops.moe_quant_x_g128_rdna4(a, xq, xs, xsum)
     out = torch.empty(M, N, dtype=a.dtype, device=a.device)
     ops.moe_w4a16_gemm_rdna4(
         xq, xs, xsum, w, ws, out, None, ids, eids[:mb], ntpp[mb - 1 : mb], 1, M, False, None, None, None, _pick_nw(N, mb)

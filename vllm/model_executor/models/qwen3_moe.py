@@ -51,7 +51,10 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 import os as _os
 
 if _os.environ.get("VLLM_ROCM_RADEON_TPCOMM", "0").lower() in ("1", "true"):
-    from radeon_ops.comm import vllm_tp as _rqc_tp  # noqa: F401  (registers torch.ops.rqcv.tp_add_rms)
+    from radeon_ops.comm import vllm_tp as _rqc_tp  # noqa: F401  (registers torch.ops.rqcv.tp_add_rms / tp_add_rms_q)
+
+    # VLLM_ROCM_RADEON_PREQUANT=1: the norms before the quantised linears / MoE also publish the int8 activation (radeon_ops.comm.prequant)
+    _rqc_norm_op = torch.ops.rqcv.tp_add_rms_q if _os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() in ("1", "true") else torch.ops.rqcv.tp_add_rms
 
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -425,9 +428,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states, residual = torch.ops.rqcv.tp_add_rms(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.variance_epsilon)
+                hidden_states, residual = _rqc_norm_op(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.variance_epsilon)
             hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-            hidden_states, residual = torch.ops.rqcv.tp_add_rms(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon)
+            hidden_states, residual = _rqc_norm_op(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon)
             hidden_states = self.mlp(hidden_states)
             return hidden_states, residual
         # Self Attention
