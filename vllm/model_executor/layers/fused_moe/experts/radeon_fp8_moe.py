@@ -9,7 +9,14 @@ straight from its epilogue, GEMM 2 applies the router weight. Blocking is vLLM's
 
 Enabled with VLLM_ROCM_RADEON_MOE=1 on gfx1201 for hidden / per-partition intermediate sizes that are multiples of 128,
 gated SiLU, no expert parallelism.
+
+VLLM_ROCM_RADEON_FP8_FFN=1 additionally runs batches with at least VLLM_ROCM_RADEON_FP8_FFN_MIN_ROWS (default 256) routed rows per expert (prefill)
+on the radeon_ops large-M W8A8 expert FFN (torch.ops.radeon.moe_ffn_w8a8_packed: 128-row blocks, reads the same packed weights); never during
+CUDA-graph capture (decode keeps the kernel above).  Qwen3-30B-A3B-FP8 TP=2 prefill (8192-token forwards): +3.2%, PPL within noise.
 """
+
+import functools
+import os
 
 import torch
 
@@ -37,6 +44,20 @@ from vllm.platforms import current_platform
 
 _BLOCK = 16
 _GROUP = 128
+_FFN = os.environ.get("VLLM_ROCM_RADEON_FP8_FFN", "0").lower() in ("1", "true")
+_FFN_MIN_ROWS = int(os.environ.get("VLLM_ROCM_RADEON_FP8_FFN_MIN_ROWS", "256"))   # below ~256 rows/expert the kernel above is as fast
+_FFN_BM = 128
+
+
+@functools.cache
+def _radeon_ffn_available() -> bool:
+    try:
+        from radeon_ops.torch_ops import load_radeon_torch_ops
+
+        load_radeon_torch_ops()
+        return hasattr(torch.ops.radeon, "moe_ffn_w8a8_packed")
+    except Exception:
+        return False
 
 
 def radeon_fp8_kernel_available() -> bool:
@@ -155,9 +176,23 @@ class RadeonFp8Experts(mk.FusedMoEExpertsModular):
         num_slots = M * top_k
         dev = hidden_states.device
 
-        sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _BLOCK, global_num_experts, None)
         xq = hidden_states.contiguous().view(torch.uint8)
         xs = a1q_scale.to(torch.float32).contiguous()
+        if (
+            _FFN
+            and num_slots >= _FFN_MIN_ROWS * global_num_experts
+            and not torch.cuda.is_current_stream_capturing()
+            and _radeon_ffn_available()
+        ):
+            sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _FFN_BM, global_num_experts, None)
+            down = workspace2.view(-1)[: num_slots * K].view(num_slots, K)
+            tw = topk_weights.reshape(-1).to(torch.float32).contiguous()
+            torch.ops.radeon.moe_ffn_w8a8_packed(
+                xq, xs, w1.view(torch.uint8), self.w1_scale, w2.view(torch.uint8), self.w2_scale, tw, sorted_ids, expert_ids, num_post, top_k, _FFN_BM, down
+            )
+            ops.moe_sum(down.view(M, top_k, K), output)
+            return
+        sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _BLOCK, global_num_experts, None)
         act = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)  # shape donor only, aq carries the data
         aq = torch.empty(num_slots, inter, dtype=torch.uint8, device=dev)
         a_s = torch.empty(num_slots, inter // _GROUP, dtype=torch.float32, device=dev)
