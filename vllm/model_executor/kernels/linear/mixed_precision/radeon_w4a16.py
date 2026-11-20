@@ -7,7 +7,14 @@ Small token counts (decode, M <= MAX_M) run the same fragment-ordered int4 x int
 weight layout is kept alongside (the packed copy costs one more int4 copy of the layer weight).
 
 Enabled with VLLM_ROCM_RADEON_LINEAR=1 for bf16 activations, K % 128 == 0, N % 16 == 0, symmetric weights.
+
+VLLM_ROCM_RADEON_PLAN=1 (with VLLM_ROCM_RADEON_RQ=1): the rq paths take their tuning from radeon_ops.qgemm.plan (the measured per-arch tuning
+table, heuristic fallback) instead of _pick_nw / VLLM_ROCM_RADEON_BIG_MIN_M: nw for the streaming kernel and, with VLLM_ROCM_RADEON_BIG, the
+streaming vs LDS large-M choice.
 """
+
+import functools
+import os
 
 import torch
 
@@ -45,6 +52,22 @@ def _radeon_available() -> bool:
     )
 
 
+_PLAN = os.environ.get("VLLM_ROCM_RADEON_PLAN", "0").lower() in ("1", "true")
+
+
+@functools.lru_cache(maxsize=4096)
+def _planned(n: int, k: int, m_bucket: int, act: int) -> tuple[bool, int]:
+    """(use the LDS large-M kernel, nw of the streaming kernel) from radeon_ops.qgemm.plan, per (N, K, power-of-two M bucket)."""
+    from radeon_ops import qgemm
+
+    p = qgemm.plan(qgemm.ActFormat(("int8", "fp8", "int4")[act]), qgemm.Epilogue.PLAIN, qgemm.GemmType.DENSE, qgemm.Shape(R=n, K=k, M=m_bucket))
+    return p.config.tuning.datapath == qgemm.Datapath.LDS, p.config.tuning.nw
+
+
+def _plan_for(n: int, k: int, m: int, act: int) -> tuple[bool, int]:
+    return _planned(n, k, 1 << max(0, (m - 1).bit_length()), act)
+
+
 def _pick_nw(n: int, m_blocks: int) -> int:
     # enough blocks to cover the CUs: each block streams nw * 16 weight rows
     for nw in (8, 4, 2):
@@ -68,7 +91,8 @@ def _radeon_w4a16_gemm_impl(
     N = w.size(1)
     if M > MAX_M and radeon_rq.big_mode() and radeon_rq.enabled() and radeon_rq.act_id() == 0 and K % 128 == 0 and N % 16 == 0:
         rq = radeon_rq.rq_ops()
-        if M >= radeon_rq.BIG_MIN_M:      # radeon_big: activations staged in LDS, 128-slot blocks of the single expert
+        use_lds, plan_nw = _plan_for(N, K, M, 0) if _PLAN else (M >= radeon_rq.BIG_MIN_M, 0)
+        if use_lds:      # radeon_big: activations staged in LDS, 128-slot blocks of the single expert
             bm = 128
             nbl = (M + bm - 1) // bm
             sorted_ids = torch.arange(nbl * bm, dtype=torch.int32, device=a.device)   # ids >= M are the padding (invalid slots)
@@ -85,7 +109,7 @@ def _radeon_w4a16_gemm_impl(
             ntpp = torch.full((1,), mb * 16, dtype=torch.int32, device=a.device)
             xq, xs, xsum = rq.quant_x(a, 0)
             out = torch.empty(M, N, dtype=a.dtype, device=a.device)
-            rq.gemm(xq, xs, xsum, w, ws, out, None, sorted_ids, eids, ntpp, 1, M, radeon_rq.EPI_PLAIN, None, None, None, _pick_nw(N, mb), 0)
+            rq.gemm(xq, xs, xsum, w, ws, out, None, sorted_ids, eids, ntpp, 1, M, radeon_rq.EPI_PLAIN, None, None, None, plan_nw or _pick_nw(N, mb), 0)
             return out
     if M > MAX_M:
         return _triton_w4a16_gemm_impl(a, b_q, scales, None, group_size, 8)
@@ -96,7 +120,8 @@ def _radeon_w4a16_gemm_impl(
         pq = radeon_rq.prequant_take(a) if act == 0 else None
         xq, xs, xsum = pq if pq is not None else rq.quant_x(a, act)
         out = torch.empty(M, N, dtype=a.dtype, device=a.device)
-        rq.gemm(xq, xs, xsum, w, ws, out, None, ids, eids[:mb], ntpp[mb - 1 : mb], 1, M, radeon_rq.EPI_PLAIN, None, None, None, _pick_nw(N, mb), act)
+        nw = _plan_for(N, K, M, act)[1] if _PLAN else _pick_nw(N, mb)
+        rq.gemm(xq, xs, xsum, w, ws, out, None, ids, eids[:mb], ntpp[mb - 1 : mb], 1, M, radeon_rq.EPI_PLAIN, None, None, None, nw, act)
         return out
     pq = radeon_rq.prequant_take(a)
     if pq is not None:
