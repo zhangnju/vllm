@@ -175,6 +175,7 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
 
         sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _BLOCK, global_num_experts, None)
         if radeon_rq.enabled():
+            self._topk_ids = topk_ids
             self._apply_rq(output, hidden_states, w1, w2, topk_weights, sorted_ids, expert_ids, num_post, inter, K, top_k, M, num_slots, workspace13, workspace2)
             return
         xq, xs, xsum = self._quant(hidden_states)
@@ -204,10 +205,22 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         a_s = torch.empty(num_slots, inter // _GROUP, dtype=torch.float32, device=dev)
         a_sum = torch.empty(num_slots, inter // _GROUP, dtype=radeon_rq.act_sum_dtype(act), device=dev)
         act_out = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)   # shape donor only (the fused epilogue writes aq)
-        rq.gemm(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_out, None, sorted_ids, expert_ids, num_post,
-                top_k, num_slots, radeon_rq.EPI_GLUQ, aq, a_s, a_sum, 8, act)
+        E = w1.size(0)
+        up_lds, down_lds, down_nw = radeon_rq.moe_plan(w1.size(1), K, inter, M, E, top_k, act) if radeon_rq.plan_enabled() else (False, False, 8)
+        if up_lds:      # measured: the LDS large-M kernel (gate/up/SiLU, 64-slot blocks) + a separate activation quantisation beats the fused-quant streaming GEMM
+            sid64, eid64, np64 = moe_align_block_size(self._topk_ids, 64, E, None)
+            act_bf = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)
+            rq.gemm_big(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_bf, None, sid64, eid64, np64, top_k, num_slots, radeon_rq.EPI_GLU)
+            aq, a_s, a_sum = rq.quant_x(act_bf, act)
+        else:
+            rq.gemm(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_out, None, sorted_ids, expert_ids, num_post,
+                    top_k, num_slots, radeon_rq.EPI_GLUQ, aq, a_s, a_sum, 8, act)
         down = workspace2.view(-1)[: num_slots * K].view(num_slots, K)
         tw = topk_weights.reshape(-1).to(torch.float32).contiguous()
-        rq.gemm(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sorted_ids, expert_ids, num_post, 1, num_slots, radeon_rq.EPI_PLAIN, None,
-                None, None, 8, act)
+        if down_lds:
+            sid128, eid128, np128 = moe_align_block_size(self._topk_ids, 128, E, None)
+            rq.gemm_big(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sid128, eid128, np128, 1, num_slots, radeon_rq.EPI_PLAIN)
+        else:
+            rq.gemm(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sorted_ids, expert_ids, num_post, 1, num_slots, radeon_rq.EPI_PLAIN, None,
+                    None, None, down_nw, act)
         ops.moe_sum(down.view(M, top_k, K), output)

@@ -34,6 +34,30 @@ _BIG = int(os.environ.get("VLLM_ROCM_RADEON_BIG", "0") or 0) if os.environ.get("
 BIG_MIN_M = int(os.environ.get("VLLM_ROCM_RADEON_BIG_MIN_M", "512"))   # radeon_big
 
 
+_PLAN = os.environ.get("VLLM_ROCM_RADEON_PLAN", "0").lower() in ("1", "true")
+
+
+def plan_enabled() -> bool:
+    return _PLAN
+
+
+@functools.lru_cache(maxsize=4096)
+def _moe_planned(r_up: int, k: int, inter: int, m_bucket: int, e: int, top_k: int, act: int) -> tuple[bool, bool, int]:
+    from radeon_ops import qgemm
+
+    a = qgemm.ActFormat(("int8", "fp8", "int4")[act])
+    up = qgemm.plan(a, qgemm.Epilogue.GLU, qgemm.GemmType.MOE_SORTED, qgemm.Shape(R=r_up, K=k, M=m_bucket, E=e, top_k=top_k))
+    dn = qgemm.plan(a, qgemm.Epilogue.PLAIN, qgemm.GemmType.MOE_SORTED, qgemm.Shape(R=k, K=inter, M=m_bucket, E=e, top_k=top_k))
+    lds = qgemm.Datapath.LDS
+    return up.config.tuning.datapath == lds, dn.config.tuning.datapath == lds, dn.config.tuning.nw
+
+
+def moe_plan(r_up: int, k: int, inter: int, m: int, e: int, top_k: int, act: int) -> tuple[bool, bool, int]:
+    """(gate-up on the LDS large-M kernel, down on the LDS kernel, nw of the streaming down GEMM) from radeon_ops.qgemm.plan
+    (the measured per-arch tuning table) for the MoE GEMMs of a batch of m tokens."""
+    return _moe_planned(r_up, k, inter, 1 << max(0, (m - 1).bit_length()), e, top_k, act)
+
+
 def big_mode() -> int:
     return _BIG
 
