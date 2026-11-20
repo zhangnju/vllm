@@ -11,6 +11,8 @@ Enabled with VLLM_ROCM_RADEON_MOE=1 on gfx1201 for symmetric, group-128 int4 che
 intermediate sizes that are multiples of 128, gated SiLU, no expert parallelism.
 """
 
+import os
+
 import torch
 
 import vllm._custom_ops as ops
@@ -52,6 +54,20 @@ def radeon_w4a16_kernel_available() -> bool:
         and hasattr(torch.ops, "_rocm_C")
         and hasattr(torch.ops._rocm_C, "moe_w4a16_gemm_rdna4")
     )
+
+
+_TRACE = [] if os.environ.get("VLLM_ROCM_RADEON_TRACE") else None
+
+
+def save_routing_trace(path: str, num_layers: int, plen: int) -> int:
+    """Write the recorded routing as ids [num_layers, sequences, positions, top_k] (int16; one prefill call per layer per sequence, eager, prompts of plen tokens;
+    calls of other lengths -- the engine's profiling / warm-up runs -- are dropped)."""
+    import numpy as np
+    calls = [t.numpy() for t in (_TRACE or []) if t.shape[0] == plen]
+    nseq = len(calls) // num_layers
+    ids = np.stack([np.stack(calls[s * num_layers:(s + 1) * num_layers]) for s in range(nseq)], axis=1)   # [L, S, P, K]
+    np.savez_compressed(path, ids=ids)
+    return nseq
 
 
 class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
@@ -173,6 +189,8 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
             global_num_experts = E
         num_slots = M * top_k
 
+        if _TRACE is not None and M > 1:
+            _TRACE.append(topk_ids.to(torch.int16).cpu())   # routing trace (VLLM_ROCM_RADEON_TRACE): one entry per MoE layer call, in layer order
         sorted_ids, expert_ids, num_post = moe_align_block_size(topk_ids, _BLOCK, global_num_experts, None)
         if radeon_rq.enabled():
             self._topk_ids = topk_ids
