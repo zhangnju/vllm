@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -207,6 +209,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
+        # RADEON (VLLM_ROCM_RADEON_AR=1, RDNA4, 2 or 4 ranks): radeon_ops' two-shot P2P all-reduce (bit-identical rank-order sum) for the message
+        # sizes where it beats RCCL on R9700 (.101 measurements): 4 ranks <= 768 KB, 2 ranks <= 512 KB or >= 12 MB; everything else falls through.
+        self.radeon_ar = None
+        if os.environ.get("VLLM_ROCM_RADEON_AR", "0") == "1" and current_platform.is_rocm() and self.world_size in (2, 4) and unique_name.split(":")[0] == "tp":
+            try:
+                from radeon_ops.comm import AllReduce
+                cap = (64 << 20) // 2 if self.world_size == 2 else (1 << 20) // 2
+                self.radeon_ar = AllReduce(self.cpu_group, device=self.device.index if hasattr(self.device, "index") else self.device, max_elems=cap)
+                self._radeon_ar_cap = cap
+                logger.info("RADEON two-shot all-reduce enabled for group %s (%d ranks)", unique_name, self.world_size)
+            except Exception as e:  # pragma: no cover
+                logger.warning("RADEON all-reduce unavailable: %s", e)
+                self.radeon_ar = None
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -386,7 +401,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    def _radeon_ar_use(self, x) -> int:
+        """0: not taken, else the block count.  R9700 (.101) vs RCCL: 2 ranks win from 16 KB to 512 KB and from 12 MB (RCCL is faster at 4-8 KB and 1-4 MB),
+        4 ranks from 4 KB to 768 KB; blocks 1 up to 16 KB, 2 up to 32 KB, 4 up to 128 KB, 8 up to 256 KB, 16 up to 4 MB, 32 above (per-block sync dominates small sizes)."""
+        if self.radeon_ar is None or x.dtype != torch.bfloat16 or not x.is_contiguous():
+            return 0
+        n, N = x.numel(), self.world_size
+        if n > self._radeon_ar_cap or n % (8 * N):
+            return 0
+        b = 2 * n
+        use = (4 << 10) <= b <= (768 << 10) if N == 4 else ((16 << 10) <= b <= (512 << 10) or b >= (12 << 20))
+        if not use:
+            return 0
+        for lim, blocks in (((16 << 10), 1), ((32 << 10), 2), ((128 << 10), 4), ((256 << 10), 8), ((4 << 20), 16)):
+            if b <= lim:
+                return blocks
+        return 32
+
     def all_reduce(self, input_):
+        blocks = self._radeon_ar_use(input_) if getattr(self, "radeon_ar", None) is not None else 0
+        if blocks:
+            return self.radeon_ar(input_, two_shot=True, blocks=blocks)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
