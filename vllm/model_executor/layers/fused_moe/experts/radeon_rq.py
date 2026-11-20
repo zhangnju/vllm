@@ -42,20 +42,26 @@ def plan_enabled() -> bool:
 
 
 @functools.lru_cache(maxsize=4096)
-def _moe_planned(r_up: int, k: int, inter: int, m_bucket: int, e: int, top_k: int, act: int) -> tuple[bool, bool, int]:
+def _moe_planned(r_up: int, k: int, inter: int, m_bucket: int, e: int, top_k: int, act: int) -> tuple[bool, bool, int, bool, int]:
     from radeon_ops import qgemm
 
     a = qgemm.ActFormat(("int8", "fp8", "int4")[act])
-    up = qgemm.plan(a, qgemm.Epilogue.GLU, qgemm.GemmType.MOE_SORTED, qgemm.Shape(R=r_up, K=k, M=m_bucket, E=e, top_k=top_k))
-    dn = qgemm.plan(a, qgemm.Epilogue.PLAIN, qgemm.GemmType.MOE_SORTED, qgemm.Shape(R=k, K=inter, M=m_bucket, E=e, top_k=top_k))
+    up = qgemm.plan(a, qgemm.Epilogue.GLU_QUANT, qgemm.GemmType.MOE_SORTED, qgemm.Shape(R=r_up, K=k, M=m_bucket, E=e, top_k=top_k)).config.tuning
+    dn = qgemm.plan(a, qgemm.Epilogue.PLAIN, qgemm.GemmType.MOE_SORTED, qgemm.Shape(R=k, K=inter, M=m_bucket, E=e, top_k=top_k)).config.tuning
     lds = qgemm.Datapath.LDS
-    return up.config.tuning.datapath == lds, dn.config.tuning.datapath == lds, dn.config.tuning.nw
+    return up.split_quant, up.datapath == lds, up.nw, dn.datapath == lds, dn.nw
 
 
-def moe_plan(r_up: int, k: int, inter: int, m: int, e: int, top_k: int, act: int) -> tuple[bool, bool, int]:
-    """(gate-up on the LDS large-M kernel, down on the LDS kernel, nw of the streaming down GEMM) from radeon_ops.qgemm.plan
-    (the measured per-arch tuning table) for the MoE GEMMs of a batch of m tokens."""
-    return _moe_planned(r_up, k, inter, 1 << max(0, (m - 1).bit_length()), e, top_k, act)
+def moe_plan(r_up: int, k: int, inter: int, m: int, e: int, top_k: int, act: int) -> tuple[bool, bool, int, bool, int]:
+    """MoE GEMM tuning from radeon_ops.qgemm.plan (the measured per-arch table) for a batch of m tokens: (gate-up as the GLU GEMM + quant_x
+    instead of the fused-quant epilogue, that GLU GEMM on the LDS large-M kernel, its nw, down on the LDS kernel, nw of the streaming down GEMM)."""
+    p = _moe_planned(r_up, k, inter, 1 << max(0, (m - 1).bit_length()), e, top_k, act)
+    o = os.environ.get("VLLM_ROCM_RADEON_PLAN_UP", "")      # A/B override of the gate-up choice: split (GLU on LDS + quant_x) / fused
+    if o == "split" and act == 0:
+        return (True, True, p[2], p[3], p[4])
+    if o == "fused":
+        return (False, False, 8, p[3], p[4])
+    return p
 
 
 def big_mode() -> int:
