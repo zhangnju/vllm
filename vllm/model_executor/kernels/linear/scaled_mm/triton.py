@@ -191,7 +191,15 @@ class TritonFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         return out.view(*output_shape)
 
 
+# VLLM_ROCM_RADEON_PREQUANT=fp8 (with VLLM_ROCM_RADEON_TPCOMM=1): the bf16 input goes into one opaque op that takes the fp8 group-128 activation the
+# fused all-reduce + add + RMSNorm kernel already produced (radeon_ops.comm.prequant, bit-identical to per_token_group_quant_fp8) or quantises it
+# with per_token_group_quant_fp8; the input quantisation is not traced into the compiled graph (a run-time hand-over cannot live there).
+_RADEON_PREQUANT_FP8 = __import__("os").environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() == "fp8"
+
+
 class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    apply_input_quant = not _RADEON_PREQUANT_FP8
+
     @classmethod
     def is_supported(cls, compute_capability=None):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
@@ -205,6 +213,8 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        if _RADEON_PREQUANT_FP8:
+            return torch.ops.vllm.radeon_prequant_fp8_block_mm_func(A, B, Bs, list(self.weight_group_shape), self.config.out_dtype)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,
@@ -284,6 +294,34 @@ def _w8a8_triton_block_scaled_mm_fake(
     return torch.empty(
         (qx.size(0), weight.size(0)), dtype=output_dtype, device=qx.device
     )
+
+
+def _radeon_prequant_fp8_block_mm_func(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.fused_moe.experts.radeon_rq import prequant_take
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+        w8a8_triton_block_scaled_mm,
+    )
+
+    pq = prequant_take(x, fp8=True) if block_size[1] == 128 else None
+    if pq is not None:
+        qx, x_scale = pq[0], pq[1]
+    else:
+        qx, x_scale = per_token_group_quant_fp8(x, block_size[1], column_major_scales=False, use_ue8m0=False)
+    return w8a8_triton_block_scaled_mm(qx, weight, x_scale, weight_scale, block_size, output_dtype)
+
+
+direct_register_custom_op(
+    "radeon_prequant_fp8_block_mm_func",
+    _radeon_prequant_fp8_block_mm_func,
+    fake_impl=lambda x, weight, weight_scale, block_size, output_dtype: torch.empty((x.size(0), weight.size(0)), dtype=output_dtype, device=x.device),
+)
 
 
 direct_register_custom_op(

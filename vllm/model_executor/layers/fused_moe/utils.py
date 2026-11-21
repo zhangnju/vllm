@@ -317,6 +317,19 @@ def _nvfp4_quantize(
     return ops.scaled_fp4_quant(A, A_scale, is_sf_swizzled_layout=is_sf_swizzled_layout)
 
 
+_RADEON_PREQUANT_FP8 = __import__("os").environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() == "fp8"
+
+
+def _radeon_prequant_fp8(A: torch.Tensor):
+    """VLLM_ROCM_RADEON_PREQUANT=fp8: the fp8 group-128 activation the fused TP all-reduce + add + RMSNorm already produced for A (bit-identical
+    to per_token_group_quant_fp8), else None.  Runs inside the opaque moe_forward op, i.e. at run time."""
+    if not _RADEON_PREQUANT_FP8:
+        return None
+    from vllm.model_executor.layers.fused_moe.experts.radeon_rq import prequant_take
+
+    return prequant_take(A, fp8=True)
+
+
 def _fp8_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
@@ -337,6 +350,9 @@ def _fp8_quantize(
         assert not per_act_token
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
+        pq = _radeon_prequant_fp8(A) if block_k == 128 and not is_scale_transposed else None
+        if pq is not None:
+            return pq[0], pq[1]
         A, A_scale = per_token_group_quant_fp8(
             A, block_k, column_major_scales=is_scale_transposed
         )

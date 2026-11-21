@@ -16,16 +16,20 @@ ACT_IDS = {"int8": 0, "fp8": 1, "int4": 2}
 EPI_PLAIN, EPI_GLU, EPI_GLUQ = 0, 1, 2
 
 
-_PREQUANT = os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() in ("1", "true")
+_PREQUANT = os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() in ("1", "true", "fp8")
 
 
-def prequant_take(a: torch.Tensor):
-    """(xq uint8, xs f32, xsum i32) if the fused all-reduce + RMSNorm just produced `a` together with its int8 group-128 quantisation, else None (radeon_ops.comm.prequant)."""
+def prequant_take(a: torch.Tensor, fp8: bool = False):
+    """(xq uint8, xs f32, xsum i32) if the fused all-reduce + RMSNorm just produced `a` together with its int8 group-128 quantisation, else None (radeon_ops.comm.prequant).
+    fp8=True: (xq float8_e4m3fn, xs f32, None), vLLM's per_token_group_fp8_quant bytes (VLLM_ROCM_RADEON_PREQUANT=fp8).  A slot in the other format is not handed out."""
     if not _PREQUANT:
         return None
     from radeon_ops.comm import prequant
 
-    return prequant.take(a)
+    pq = prequant.take(a)
+    if pq is not None and (pq[0].dtype == torch.float8_e4m3fn) != fp8:
+        return None
+    return pq
 
 
 # VLLM_ROCM_RADEON_BIG=1: dense W4A16 layers with M >= VLLM_ROCM_RADEON_BIG_MIN_M (default 512) run the LDS large-M rq kernel (rq.gemm_big, int8 activations);

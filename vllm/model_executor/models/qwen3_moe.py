@@ -53,8 +53,10 @@ import os as _os
 if _os.environ.get("VLLM_ROCM_RADEON_TPCOMM", "0").lower() in ("1", "true"):
     from radeon_ops.comm import vllm_tp as _rqc_tp  # noqa: F401  (registers torch.ops.rqcv.tp_add_rms / tp_add_rms_q)
 
-    # VLLM_ROCM_RADEON_PREQUANT=1: the norms before the quantised linears / MoE also publish the int8 activation (radeon_ops.comm.prequant)
-    _rqc_norm_op = torch.ops.rqcv.tp_add_rms_q if _os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower() in ("1", "true") else torch.ops.rqcv.tp_add_rms
+    # VLLM_ROCM_RADEON_PREQUANT=1: the norms before the quantised linears / MoE also publish the int8 activation (radeon_ops.comm.prequant);
+    # =fp8: the fp8 e4m3fn group-128 activation of the block-fp8 linears / fp8 MoE (vLLM's per_token_group_fp8_quant bytes)
+    _rqc_pq = _os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower()
+    _rqc_norm_op = (torch.ops.rqcv.tp_add_rms_qf8 if _rqc_pq == "fp8" else torch.ops.rqcv.tp_add_rms_q if _rqc_pq in ("1", "true") else torch.ops.rqcv.tp_add_rms)
 
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
