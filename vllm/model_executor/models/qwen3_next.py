@@ -767,7 +767,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if getattr(self, "rqc_tpcomm", False):   # Qwen3.5 / 3.6 with VLLM_ROCM_RADEON_TPCOMM: the last layer's output is partial (Gemma norm)
+            hidden_states, _ = torch.ops.rqcv.tp_add_rms(hidden_states, residual, self.norm.weight, self.norm.variance_epsilon, True)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if self.use_sequence_parallel:
             if aux_hidden_states:
                 hidden_size = hidden_states.shape[-1]

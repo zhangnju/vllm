@@ -59,6 +59,23 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeMLP as Qwen3NextMLP
+import os as _os
+
+if _os.environ.get("VLLM_ROCM_RADEON_TPCOMM", "0").lower() in ("1", "true"):
+    from radeon_ops.comm import vllm_tp as _rqc_tp  # noqa: F401  (registers torch.ops.rqcv.tp_add_rms / _q / _qf8)
+
+    # VLLM_ROCM_RADEON_PREQUANT=1: the norms before the quantised linears / MoE also publish the int8 activation; =fp8: the fp8 e4m3fn group-128 one
+    _rqc_pq = _os.environ.get("VLLM_ROCM_RADEON_PREQUANT", "0").lower()
+    _rqc_norm_op = (torch.ops.rqcv.tp_add_rms_qf8 if _rqc_pq == "fp8" else torch.ops.rqcv.tp_add_rms_q if _rqc_pq in ("1", "true") else torch.ops.rqcv.tp_add_rms)
+
+
+def _tpcomm_on(use_sp: bool = False) -> bool:
+    """VLLM_ROCM_RADEON_TPCOMM=1 (2 or 4 TP ranks, no sequence-parallel MoE): GDN out_proj / attention o_proj / MoE outputs stay partial and the next
+    Gemma RMSNorm is fused with the all-reduce (radeon_ops.comm)."""
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    return (_os.environ.get("VLLM_ROCM_RADEON_TPCOMM", "0").lower() in ("1", "true") and get_tensor_model_parallel_world_size() in (2, 4)
+            and not use_sp)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -142,13 +159,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             parallel_config.use_sequence_parallel_moe and is_moe_layer
         )
 
+        self.rqc_tpcomm = _tpcomm_on(self.use_attn_reduce_scatter_for_moe)
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
                 config=config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=not (self.use_attn_reduce_scatter_for_moe or self.rqc_tpcomm),
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -157,7 +175,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=not (self.use_attn_reduce_scatter_for_moe or self.rqc_tpcomm),
                 mrope_positions_factor=mrope_positions_factor(vllm_config),
             )
         else:
@@ -169,7 +187,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             self.mlp = Qwen3NextSparseMoeBlock(
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.mlp",
+                **({"reduce_results": False} if self.rqc_tpcomm else {}),
             )
+            if self.rqc_tpcomm:
+                assert not self.mlp.replicate_shared_expert, "TPCOMM needs the TP-sharded shared expert (its output must be partial like the routed one)"
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
@@ -189,6 +210,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         )
 
         self.layer_scale = getattr(config, "layer_scale", False)
+        if self.rqc_tpcomm:
+            assert not self.layer_scale and config.model_type == "qwen3_5_moe_text", "TPCOMM path: Qwen3.5 / 3.6 MoE without layer_scale"
         if self.layer_scale:
             self.attn_layer_scale = torch.nn.Parameter(
                 torch.zeros(
@@ -204,6 +227,25 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+
+
+    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None, positions: torch.Tensor, **kwargs: object):
+        if not self.rqc_tpcomm:
+            return super().forward(hidden_states, residual, positions, **kwargs)
+        # VLLM_ROCM_RADEON_TPCOMM: hidden_states arrives (and leaves) as this rank's PARTIAL sum; the all-reduce is fused into the next add + Gemma RMSNorm
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = _rqc_norm_op(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.variance_epsilon, True)
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(hidden_states=hidden_states)
+        else:
+            hidden_states = self.self_attn(hidden_states=hidden_states, positions=positions)
+        hidden_states, residual = _rqc_norm_op(hidden_states, residual, self.post_attention_layernorm.weight,
+                                               self.post_attention_layernorm.variance_epsilon, True)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 @support_torch_compile(
@@ -259,6 +301,11 @@ class Qwen3_5Model(Qwen3NextModel):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        self.rqc_tpcomm = any(getattr(l, "rqc_tpcomm", False) for l in self.layers)
+        if self.rqc_tpcomm:
+            from radeon_ops.comm.vllm_tp import init_tp_comm
+
+            init_tp_comm()
         self.fused_shared_expert_layers = get_fused_shared_expert_layers(
             self,
             Qwen3NextSparseMoeBlock,
