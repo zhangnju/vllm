@@ -228,7 +228,10 @@ def _backend_incompatibility_reason(
 
     if backend == WNA16MoEBackend.RADEON:
         if may_have_zp:
-            return "asymmetric checkpoints are not supported"
+            from vllm.model_executor.layers.fused_moe.experts import radeon_rq
+
+            if not radeon_rq.enabled():
+                return "asymmetric checkpoints need the rq path (VLLM_ROCM_RADEON_RQ=1: per-group zero points)"
         if may_have_bias:
             return "expert bias is not supported"
         if _radeon_group_size(quant_config) != 128:
@@ -1739,7 +1742,25 @@ def convert_to_wna16_moe_kernel_format(
             E_, R_, G_ = sc.shape
             return sc.to(torch.bfloat16).reshape(E_, R_ // 16, 16, G_).permute(0, 1, 3, 2).contiguous()
 
-        return (packed[0], packed[1], _scales(w13_scale), _scales(w2_scale), None, None, None, None)
+        def _zeros(zp: torch.Tensor | None, name: str) -> torch.Tensor | None:
+            """Asymmetric checkpoints: packed uint8 zero points [E, R/2, G] (even row in the low nibble, Quark / WNA16 layout) -> rq's scale tile layout
+            [E, R/16, G, 16] uint8; replaces the layer parameter so that the MoE quant config hands it to RadeonW4A16Experts (rq `wzp`)."""
+            if zp is None:
+                return None
+            E_, R2_, G_ = zp.shape
+            z = torch.empty(E_, R2_ * 2, G_, dtype=torch.uint8, device=zp.device)
+            zu = zp.view(torch.uint8)
+            z[:, 0::2] = zu & 0xF
+            z[:, 1::2] = zu >> 4
+            out = z.reshape(E_, R2_ * 2 // 16, 16, G_).permute(0, 1, 3, 2).contiguous()
+            if hasattr(layer, name):
+                from vllm.model_executor.utils import replace_parameter
+
+                replace_parameter(layer, name, out)
+            return out
+
+        return (packed[0], packed[1], _scales(w13_scale), _scales(w2_scale), _zeros(w13_qzeros, "w13_weight_zero_point"),
+                _zeros(w2_qzeros, "w2_weight_zero_point"), None, None)
 
     elif backend == WNA16MoEBackend.RDNA3:
         assert isinstance(quant_config, QuantizationArgs)

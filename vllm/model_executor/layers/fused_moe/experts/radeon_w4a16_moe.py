@@ -7,7 +7,8 @@ quantised to int8 per 128-wide K group and multiplied with the unsigned nibbles 
 group scales being applied once per group. GEMM 1 fuses gate+up+SiLU*mul and writes the bf16 activation directly, GEMM 2 applies
 the router weight in its epilogue; blocking is vLLM's own moe_align_block_size (block size 16).
 
-Enabled with VLLM_ROCM_RADEON_MOE=1 on gfx1201 for symmetric, group-128 int4 checkpoints, hidden and per-partition
+Enabled with VLLM_ROCM_RADEON_MOE=1 on gfx1201 for symmetric, group-128 int4 checkpoints (asymmetric ones -- per-group zero points, e.g.
+Quark UINT4 -- with VLLM_ROCM_RADEON_RQ=1: rq's int4 kernels take the zero points), hidden and per-partition
 intermediate sizes that are multiples of 128, gated SiLU, no expert parallelism.
 """
 
@@ -31,7 +32,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey, kInt4Static
+from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey, kInt4Static, kInt4StaticAsym
 from vllm.platforms import current_platform
 
 _BLOCK = 16
@@ -111,7 +112,8 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_quant_scheme(weight_key: QuantKey | None, activation_key: QuantKey | None) -> bool:
-        return weight_key == kInt4Static and activation_key is None
+        # asymmetric int4 (per-group zero points, e.g. Quark UINT4) on the rq path only: rq's int4 kernels take the zero points (`wzp`)
+        return activation_key is None and (weight_key == kInt4Static or (weight_key == kInt4StaticAsym and radeon_rq.enabled()))
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -224,26 +226,27 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         a_sum = torch.empty(num_slots, inter // _GROUP, dtype=radeon_rq.act_sum_dtype(act), device=dev)
         act_out = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)   # shape donor only (the fused epilogue writes aq)
         E = w1.size(0)
+        z1, z2 = self.w1_zp, self.w2_zp   # asymmetric checkpoints: uint8 zero points in the scale tile layout (int_wna16 RADEON conversion), else None
         up_split, up_lds, up_nw, down_lds, down_nw = (radeon_rq.moe_plan(w1.size(1), K, inter, M, E, top_k, act) if radeon_rq.plan_enabled()
                                                        else (False, False, 8, False, 8))
         if up_split:    # measured faster: the gate/up/SiLU GEMM with the bf16 GLU epilogue (streaming nw or the LDS kernel) + quant_x, bit-identical to the fused epilogue
             act_bf = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)
             if up_lds:
                 sid64, eid64, np64 = moe_align_block_size(self._topk_ids, 64, E, None)
-                rq.gemm_big(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_bf, None, sid64, eid64, np64, top_k, num_slots, radeon_rq.EPI_GLU)
+                rq.gemm_big(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_bf, None, sid64, eid64, np64, top_k, num_slots, radeon_rq.EPI_GLU, z1)
             else:
                 rq.gemm(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_bf, None, sorted_ids, expert_ids, num_post, top_k, num_slots, radeon_rq.EPI_GLU,
-                        None, None, None, up_nw, act)
+                        None, None, None, up_nw, act, z1)
             aq, a_s, a_sum = rq.quant_x(act_bf, act)
         else:
             rq.gemm(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_out, None, sorted_ids, expert_ids, num_post,
-                    top_k, num_slots, radeon_rq.EPI_GLUQ, aq, a_s, a_sum, 8, act)
+                    top_k, num_slots, radeon_rq.EPI_GLUQ, aq, a_s, a_sum, 8, act, z1)
         down = workspace2.view(-1)[: num_slots * K].view(num_slots, K)
         tw = topk_weights.reshape(-1).to(torch.float32).contiguous()
         if down_lds:
             sid128, eid128, np128 = moe_align_block_size(self._topk_ids, 128, E, None)
-            rq.gemm_big(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sid128, eid128, np128, 1, num_slots, radeon_rq.EPI_PLAIN)
+            rq.gemm_big(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sid128, eid128, np128, 1, num_slots, radeon_rq.EPI_PLAIN, z2)
         else:
             rq.gemm(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sorted_ids, expert_ids, num_post, 1, num_slots, radeon_rq.EPI_PLAIN, None,
-                    None, None, down_nw, act)
+                    None, None, down_nw, act, z2)
         ops.moe_sum(down.view(M, top_k, K), output)
