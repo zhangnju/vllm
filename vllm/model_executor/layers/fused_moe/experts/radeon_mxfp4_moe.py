@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OCP MXFP4 (e2m1 + e8m0 per 32) MoE experts on radeon_ops (RDNA4, gfx1201): W4A16 -- bf16 activations, the checkpoint's packed weights read as is.
 
-torch.ops.radeon.moe_ffn_mxfp4 runs decode-sized batches (M <= VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M, default 128) on the fused MXFP4 decode GEMV and larger
-ones on the large-M bf16-WMMA kernel (gate-up + SiLU, down, top-k reduce); weights [E, 2N, K/2] / [E, K, N/2] uint8 (gate rows first), scales e8m0
+torch.ops.radeon.moe_ffn_mxfp4 runs decode-sized batches (M <= VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M, default 48) on the fused MXFP4 decode GEMV, up to
+VLLM_ROCM_RADEON_MXFP4_DG_MAX_M (default 896) tokens on the grouped weight-streaming WMMA kernels (16-row blocks) and larger ones on the large-M bf16-WMMA kernel
+(gate-up + SiLU, down, top-k reduce); weights [E, 2N, K/2] / [E, K, N/2] uint8 (gate rows first), scales e8m0
 [E, 2N, K/32] / [E, K, N/32].  Enabled with VLLM_ROCM_RADEON_MOE=1.  Checkpoints that also quantise activations (Quark w_mxfp4_a_mxfp4, W4A4) run with
 unquantised bf16 activations here: the weights are exact, the activations more precise than the checkpoint's emulated MXFP4.
 """
@@ -27,7 +28,9 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey, kMxfp4Static
 from vllm.platforms import current_platform
 
-_DECODE_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M", "128"))   # R9700, E 256 / H 2048 / inter 512: GEMV vs WMMA cross at ~128 tokens
+# R9700, E 256 / H 2048 / inter 512 (one MoE layer): GEMV < grouped from ~48 tokens, grouped < large-M from ~1024
+_DECODE_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M", "48"))
+_DG_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_DG_MAX_M", "896"))
 
 
 @functools.cache
@@ -157,6 +160,6 @@ class RadeonMxfp4Experts(mk.FusedMoEExpertsModular):
         # vLLM marks unrouted slots with expert id -1 (padding / warm-up batches): every radeon path skips ids < 0 in-kernel
         out = torch.ops.radeon.moe_ffn_mxfp4(
             hidden_states, w1.view(torch.uint8), self.w1_scale.view(torch.uint8), w2.view(torch.uint8), self.w2_scale.view(torch.uint8),
-            topk_ids, topk_weights, 0, _DECODE_MAX_M,
+            topk_ids, topk_weights, 0, _DECODE_MAX_M, _DG_MAX_M,
         )
         output.copy_(out)

@@ -40,6 +40,13 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 SUPPORTED_GROUP_SIZES = [32, 64, 128]
 
+# VLLM_ROCM_RADEON_HYBRID_BIG=1 (gfx1201, radeon_ops rq): symmetric g128 layers also keep an rq-packed copy and run batches of
+# >= VLLM_ROCM_RADEON_HYBRID_BIG_MIN_M rows on rq's LDS large-M kernel (int8 activations, int8-WMMA); smaller batches keep the skinny / Triton paths.
+import os as _os
+
+_RADEON_BIG = _os.environ.get("VLLM_ROCM_RADEON_HYBRID_BIG", "0").lower() in ("1", "true")
+_RADEON_BIG_MIN_M = int(_os.environ.get("VLLM_ROCM_RADEON_HYBRID_BIG_MIN_M", "256"))
+
 logger = init_logger(__name__)
 
 
@@ -761,6 +768,9 @@ def _rdna_hybrid_w4a16_apply_impl(
     group_size: int,
     w_dequant: torch.Tensor | None = None,
     w_scale_zp_carrier: torch.Tensor | None = None,
+    rq_w: torch.Tensor | None = None,
+    rq_s: torch.Tensor | None = None,
+    rq_zp: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
@@ -774,6 +784,21 @@ def _rdna_hybrid_w4a16_apply_impl(
     M = x_2d.shape[0]
     K = x_2d.shape[1]
     N = w_q.shape[0]
+
+    if rq_w is not None and M >= _RADEON_BIG_MIN_M:   # radeon_ops rq LDS large-M kernel (VLLM_ROCM_RADEON_HYBRID_BIG)
+        with _profile_scope(f"radeon_rq_big_w4a16 {M}x{N}x{K}"):
+            rq = torch.ops.rq
+            bm = 128
+            nbl = (M + bm - 1) // bm
+            sorted_ids = torch.arange(nbl * bm, dtype=torch.int32, device=x_2d.device)   # ids >= M: padding slots
+            eids = torch.zeros(nbl, dtype=torch.int32, device=x_2d.device)
+            ntpp = torch.full((1,), nbl * bm, dtype=torch.int32, device=x_2d.device)
+            xq, xs, xsum = rq.quant_x(x_2d.contiguous(), 0)
+            out = torch.empty(M, N, dtype=x_2d.dtype, device=x_2d.device)
+            rq.gemm_big(xq, xs, xsum, rq_w, rq_s, out, None, sorted_ids, eids, ntpp, 1, M, 0, rq_zp)   # rq_zp: asymmetric zero points (None = 8)
+            if bias is not None:
+                out.add_(bias)
+            return out
 
     if _max_skinny_batch_size() >= M and (
         K * M <= MEDIUM_SKINNY_LIMIT_ELEMENTS or _on_gfx115x()
@@ -809,6 +834,9 @@ def _rdna_hybrid_w4a16_apply_fake(
     group_size: int,
     w_dequant: torch.Tensor | None = None,
     w_scale_zp_carrier: torch.Tensor | None = None,
+    rq_w: torch.Tensor | None = None,
+    rq_s: torch.Tensor | None = None,
+    rq_zp: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M = x_2d.size(0)
     N = w_q.size(0)
@@ -954,6 +982,24 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             ).data.contiguous(),
         )
 
+        if _RADEON_BIG and c.group_size == 128 and unpacked.shape[0] % 16 == 0 and unpacked.shape[1] % 128 == 0:
+            # rq-packed copy: uint4b8 nibbles (value + 8) are rq's INT4_U encoding as they are, asymmetric uint4 nibbles are raw with per-group zero points
+            # (rq's ZP kernels); scales (and zero points) -> the tile layout [1, N/16, G, 16]
+            from vllm.model_executor.layers.fused_moe.experts import radeon_rq
+
+            rq = radeon_rq.rq_ops()
+            q = unpacked.to(torch.uint8)
+            nib = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous().unsqueeze(0)
+            _, w_s_t, _ = self._get_weight_params(layer)
+            n_, g_ = w_s_t.shape
+            layer.register_buffer("radeon_rq_w", rq.pack_w4(nib, 0), persistent=False)
+            layer.register_buffer("radeon_rq_s", w_s_t.data.to(torch.bfloat16).reshape(n_ // 16, 16, g_).permute(0, 2, 1).contiguous().unsqueeze(0),
+                                  persistent=False)
+            if c.zero_points:
+                _, _, w_zp_t = self._get_weight_params(layer)          # [N // 8, G] int32 packed along N (permuted above)
+                z = unpack_quantized_values_into_int32(w_zp_t.data, c.weight_type, packed_dim=0).to(torch.uint8)   # [N, G]
+                layer.register_buffer("radeon_rq_zp", z.reshape(n_ // 16, 16, g_).permute(0, 2, 1).contiguous().unsqueeze(0), persistent=False)
+
         kernel_config = get_current_vllm_config().kernel_config
         if kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable":
             _, w_s, w_zp = self._get_weight_params(layer)
@@ -1007,5 +1053,8 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             c.group_size,
             getattr(layer, self.DEQUANT_WEIGHT_NAME, None),
             getattr(layer, "_hybrid_w_scale_zp_carrier", None),
+            getattr(layer, "radeon_rq_w", None),
+            getattr(layer, "radeon_rq_s", None),
+            getattr(layer, "radeon_rq_zp", None),
         )
         return output.reshape(out_shape)
