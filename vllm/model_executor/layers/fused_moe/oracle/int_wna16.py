@@ -206,6 +206,15 @@ def _zen_cpu_num_bits(
     return None
 
 
+def _radeon_group_size(quant_config) -> int | None:
+    """Group size of a GPTQ / compressed-tensors config, or of a Quark config's global weight spec (QuarkConfig has no group_size attribute;
+    Quark int4 checkpoints carry it in quantization_config.global_quant_config.weight)."""
+    gs = getattr(quant_config, "group_size", None)
+    if gs is None and getattr(quant_config, "get_name", lambda: None)() == "quark":
+        gs = ((quant_config.quant_config.get("global_quant_config") or {}).get("weight") or {}).get("group_size")
+    return gs
+
+
 def _backend_incompatibility_reason(
     backend: WNA16MoEBackend,
     moe_config: FusedMoEConfig,
@@ -222,7 +231,7 @@ def _backend_incompatibility_reason(
             return "asymmetric checkpoints are not supported"
         if may_have_bias:
             return "expert bias is not supported"
-        if getattr(quant_config, "group_size", None) != 128:
+        if _radeon_group_size(quant_config) != 128:
             return "group size 128 only"
         if getattr(quant_config, "desc_act", False) or getattr(quant_config, "actorder", None) == "group":
             return "activation ordering is not supported"
