@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Union
 
 import torch
 
+import vllm.envs as envs
+
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
@@ -187,6 +189,8 @@ class Mxfp4MoeBackend(Enum):
     CPU = "CPU"
     # Emulation
     EMULATION = "EMULATION"
+    # Radeon (gfx1201, VLLM_ROCM_RADEON_MOE=1): radeon_ops OCP MXFP4 W4A16 (decode GEMV / large-M bf16-WMMA)
+    RADEON = "RADEON"
     # Humming
     HUMMING = "HUMMING"
     # FlashInfer MoE-EP megakernels: routing outside, dispatch/GEMMs/combine fused.
@@ -364,6 +368,11 @@ def backend_to_kernel_cls(
 
         return [OCP_MXQuantizationEmulationTritonExperts]
 
+    elif backend == Mxfp4MoeBackend.RADEON:
+        from vllm.model_executor.layers.fused_moe.experts.radeon_mxfp4_moe import RadeonMxfp4Experts
+
+        return [RadeonMxfp4Experts]
+
     elif backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
         from vllm.model_executor.layers.fused_moe.experts.flashinfer_moe_ep import (  # noqa: E501
             FlashInferMoeEpExperts,
@@ -449,6 +458,9 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.CPU,
         Mxfp4MoeBackend.EMULATION,
     ]
+    if current_platform.is_rocm() and envs.VLLM_ROCM_RADEON_MOE:
+        # Radeon (gfx1201): the radeon_ops W4A16 kernels first, ahead of the dequantise-every-forward emulation
+        _AVAILABLE_BACKENDS.insert(0, Mxfp4MoeBackend.RADEON)
     if current_platform.is_cuda() and (
         current_platform.is_device_capability_family(110)
         or current_platform.is_device_capability_family(120)
@@ -643,6 +655,10 @@ def _filter_by_activation(
     list as-is so explicit non-BF16 picks (e.g. the `_afp8` aliases) still
     land."""
     bf16 = [b for b in backends if _backend_activation_key(b) is None]
+    if requested_activation_key is not None and Mxfp4MoeBackend.RADEON in backends:
+        # RADEON (opt-in, VLLM_ROCM_RADEON_MOE=1) runs W4A4 checkpoints as W4A16 and takes precedence over emulation
+        rest = _filter_by_activation([b for b in backends if b != Mxfp4MoeBackend.RADEON], requested_activation_key)
+        return [Mxfp4MoeBackend.RADEON] + rest
     if requested_activation_key is not None:
         matching = [
             b
@@ -1548,6 +1564,8 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.RADEON:   # radeon_ops reads the checkpoint layout as is
+        return (w13_weight, w2_weight, w13_weight_scale, w2_weight_scale, w13_bias, w2_bias)
     elif mxfp4_backend == Mxfp4MoeBackend.EMULATION:
         w13_has_per_expert_scale = (
             w13_input_scale is not None
@@ -2037,6 +2055,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     elif mxfp4_backend in (
         Mxfp4MoeBackend.XPU,
         Mxfp4MoeBackend.EMULATION,
+        Mxfp4MoeBackend.RADEON,
     ):
         # No additional transformation is needed: XPU consumes the checkpoint
         # layout directly, while emulation dequantizes that layout at runtime.
