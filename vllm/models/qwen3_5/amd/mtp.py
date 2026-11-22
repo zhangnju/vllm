@@ -47,6 +47,35 @@ from vllm.sequence import IntermediateTensors
 
 from .model import Qwen3_5DecoderLayer, Qwen3_5Model, Qwen3_5RMSNorm
 
+_QUANT_SUFFIXES = ("weight_scale", "weight_scale_inv", "weight_zero_point", "qweight", "qzeros", "scales", "weight_packed", "input_scale")
+
+
+def _mtp_checkpoint_unquantized(model_config) -> bool:
+    """True when the checkpoint stores the MTP head in plain bf16 / fp16 / fp32 although the model is quantized -- e.g. AMD Quark exports
+    of Qwen3.5 / 3.6, whose quantizer never sees the mtp.* modules (copied as is) and whose exclude list does not name them.  Reads the
+    safetensors headers only (no tensor data); False when unsure (remote / no safetensors / no mtp.* tensors)."""
+    import glob
+    import os
+
+    path = getattr(model_config, "model", None)
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        from safetensors import safe_open
+
+        seen = False
+        for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+            with safe_open(f, "pt") as h:
+                for k in h.keys():
+                    if not k.startswith("mtp."):
+                        continue
+                    seen = True
+                    if k.endswith(_QUANT_SUFFIXES) or h.get_slice(k).get_dtype() not in ("BF16", "F16", "F32"):
+                        return False
+        return seen
+    except Exception:
+        return False
+
 logger = init_logger(__name__)
 
 
@@ -77,9 +106,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
         # Ref: https://github.com/vllm-project/vllm/pull/38650
         # Ref: https://github.com/NVIDIA/Model-Optimizer/pull/1124
+        # Same for checkpoints whose whole MTP head is unquantized without the quant config saying so (AMD Quark exports): build it unquantized.
+        mtp_unquantized = bool(quant_config) and _mtp_checkpoint_unquantized(model_config)
+        if mtp_unquantized:
+            logger.info_once("MTP head stored unquantized in the %s checkpoint: building the MTP layers without quantization", quant_config.get_name())
         fc_quant = (
             None
-            if (quant_config and quant_config.get_name() == "modelopt_fp4")
+            if (quant_config and quant_config.get_name() == "modelopt_fp4") or mtp_unquantized
             else quant_config
         )
         self.fc = ColumnParallelLinear(
@@ -102,6 +135,8 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 dynamic = hf_qc.get("dynamic", {})
                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
                     vllm_config.quant_config = None
+            if mtp_unquantized:
+                vllm_config.quant_config = None
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
