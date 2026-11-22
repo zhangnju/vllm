@@ -313,6 +313,17 @@ class AutoGPTQConfig(QuantizationConfig):
         self.modules_in_block_to_quantize = list(quant_layers)
 
 
+def _radeon_batch_invariant_linear(quant_config) -> bool:
+    """ROCm + the Radeon hybrid W4A16 kernel with its rq copy (VLLM_ROCM_RADEON_HYBRID_BIG): batch-invariant on its own, so VLLM_BATCH_INVARIANT keeps it."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import radeon_batch_invariant_linear_ok
+
+    return radeon_batch_invariant_linear_ok(quant_config.group_size, False)
+
+
 class AutoGPTQLinearMethod(LinearMethodBase):
     """Linear method for AutoGPTQ using Marlin kernels.
 
@@ -329,7 +340,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         # The Marlin GEMM picks its tiling and K-split from the number of
         # tokens, so its results depend on the batch size. In batch-invariant
         # mode, dequantize the weight and use the batch-invariant matmul.
-        self.use_batch_invariant = envs.VLLM_BATCH_INVARIANT
+        self.use_batch_invariant = envs.VLLM_BATCH_INVARIANT and not _radeon_batch_invariant_linear(quant_config)
         self.kernel: MPLinearKernel | None = None
 
         # Verify supported on platform.

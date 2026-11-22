@@ -771,6 +771,28 @@ def _pad_activation_rows(x_2d: torch.Tensor) -> torch.Tensor:
     return padded
 
 
+def _batch_invariant() -> bool:
+    if not _RADEON_BIG:
+        return False
+    from radeon_ops.batch_invariant import enabled
+
+    return enabled()
+
+
+def radeon_batch_invariant_linear_ok(group_size: int, zero_points: bool) -> bool:
+    """VLLM_BATCH_INVARIANT with VLLM_ROCM_RADEON_HYBRID_BIG on gfx1201: g128 W4A16 layers keep an rq copy and run every M on rq's (bit-identical) kernels, so the
+    hybrid kernel is batch-invariant there -- quantization methods may keep it instead of their dequantise + batch-invariant matmul fallback."""
+    if not (_RADEON_BIG and group_size == 128 and _on_gfx12x()):
+        return False
+    try:
+        from vllm.model_executor.layers.fused_moe.experts import radeon_rq
+
+        radeon_rq.rq_ops()
+        return True
+    except Exception:
+        return False
+
+
 @functools.lru_cache(maxsize=4096)
 def _rq_planned(n: int, k: int, m_bucket: int) -> tuple[bool, int]:
     from radeon_ops import qgemm
@@ -828,7 +850,8 @@ def _rdna_hybrid_w4a16_apply_impl(
     K = x_2d.shape[1]
     N = w_q.shape[0]
 
-    if rq_w is not None and (M >= _RADEON_RQ_MIN_M or w_q.size(1) == 0):   # radeon_ops rq (VLLM_ROCM_RADEON_HYBRID_BIG); w_q [N, 0]: rq-only layer
+    if rq_w is not None and (M >= _RADEON_RQ_MIN_M or w_q.size(1) == 0 or _batch_invariant()):   # radeon_ops rq (VLLM_ROCM_RADEON_HYBRID_BIG); w_q [N, 0]: rq-only layer;
+                                                                                                    # batch-invariant mode: rq at every M (all rq kernels are bit-identical)
         N = rq_w.size(1)
         use_lds, nw = _rq_plan(N, K, M)
         with _profile_scope(f"radeon_rq_{'big' if use_lds else 'stream'}_w4a16 {M}x{N}x{K}"):

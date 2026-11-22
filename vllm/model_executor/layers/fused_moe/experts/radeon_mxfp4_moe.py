@@ -96,6 +96,10 @@ class RadeonMxfp4Experts(mk.FusedMoEExpertsModular):
         return radeon_mxfp4_kernel_available()
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        return True   # radeon_ops batch-invariant mode (on with VLLM_BATCH_INVARIANT): moe_ffn_mxfp4 skips its decode GEMV; the grouped and large-M kernels are bit-identical
+
+    @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return False
 

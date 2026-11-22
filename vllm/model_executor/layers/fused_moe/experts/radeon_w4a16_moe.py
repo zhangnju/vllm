@@ -107,6 +107,12 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         return radeon_w4a16_kernel_available()
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        # on rq every GEMM is one of rq's kernels (streaming / LDS large-M, fused / split GLU quantisation): bit-identical per row whatever the batch (radeon_ops
+        # qgemm tuning guard); the in-tree kernels are not claimed
+        return radeon_rq.enabled()
+
+    @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return False
 

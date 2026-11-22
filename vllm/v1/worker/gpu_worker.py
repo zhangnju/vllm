@@ -1919,6 +1919,13 @@ def init_worker_distributed_environment(
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
+    if envs.VLLM_BATCH_INVARIANT and current_platform.is_rocm():   # radeon_ops' dispatchers stay in one bit-identical kernel family
+        try:
+            import radeon_ops
+
+            radeon_ops.set_batch_invariant(True)
+        except Exception:
+            pass
     override_envs_for_eplb(
         parallel_config,
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),

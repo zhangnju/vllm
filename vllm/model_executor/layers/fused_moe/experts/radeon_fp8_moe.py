@@ -270,6 +270,10 @@ class RadeonFp8W8A16Experts(mk.FusedMoEExpertsModular):
         return radeon_fp8_w8a16_available()
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        return True   # radeon_ops batch-invariant mode (on with VLLM_BATCH_INVARIANT): the bm 32 FFN at every M, no decode GEMV
+
+    @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return False
 
