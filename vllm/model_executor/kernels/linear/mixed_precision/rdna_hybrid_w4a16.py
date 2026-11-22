@@ -16,6 +16,7 @@ transposes tiles in-register). No dual weight storage unless
 `rdna_hybrid_w4a16_prefill_dequant` caches the dense prefill copy.
 """
 
+import functools
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
@@ -46,6 +47,12 @@ import os as _os
 
 _RADEON_BIG = _os.environ.get("VLLM_ROCM_RADEON_HYBRID_BIG", "0").lower() in ("1", "true")
 _RADEON_BIG_MIN_M = int(_os.environ.get("VLLM_ROCM_RADEON_HYBRID_BIG_MIN_M", "256"))
+# VLLM_ROCM_RADEON_HYBRID_RQ_MIN_M (default 6, with HYBRID_BIG): batches of >= this many rows run on rq (streaming kernel, LDS large-M kernel from
+# radeon_ops.qgemm.plan) instead of Triton -- R9700 Qwen3.6 dense shapes M 6-8192: 0.26-0.88x Triton's time.  Below it the HIP skinny kernel, except on
+# layers with N >= VLLM_ROCM_RADEON_HYBRID_RQ_ONLY_N (default 8192): rq ties skinny there (0.95-1.06x at M <= 5), so the skinny copy is dropped and
+# rq runs every M (one int4 copy instead of two: ~470 MB on Qwen3.6-35B-A3B).  Small-N layers keep both (skinny 1.1-1.7x faster at M <= 5).
+_RADEON_RQ_MIN_M = int(_os.environ.get("VLLM_ROCM_RADEON_HYBRID_RQ_MIN_M", "6"))
+_RADEON_RQ_ONLY_N = int(_os.environ.get("VLLM_ROCM_RADEON_HYBRID_RQ_ONLY_N", "8192"))
 
 logger = init_logger(__name__)
 
@@ -758,6 +765,36 @@ def _pad_activation_rows(x_2d: torch.Tensor) -> torch.Tensor:
     return padded
 
 
+@functools.lru_cache(maxsize=4096)
+def _rq_planned(n: int, k: int, m_bucket: int) -> tuple[bool, int]:
+    from radeon_ops import qgemm
+
+    p = qgemm.plan(qgemm.ActFormat("int8"), qgemm.Epilogue.PLAIN, qgemm.GemmType.DENSE, qgemm.Shape(R=n, K=k, M=m_bucket)).config.tuning
+    return p.datapath == qgemm.Datapath.LDS, p.nw
+
+
+_RQ_MAX_SLOTS = 1 << 16
+_rq_static: dict = {}
+
+
+def _rq_routing(device: torch.device, nbl: int, bm: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The single-expert routing of an rq dense GEMM (sorted ids 0..nbl*bm-1, ids >= M = padding; expert 0 per block; nbl*bm slots) as slices of buffers
+    allocated once per device: no tensor-creation kernels per call (three per linear per step otherwise, ~the GEMM's own time at decode sizes)."""
+    if nbl * bm > _RQ_MAX_SLOTS:
+        return (torch.arange(nbl * bm, dtype=torch.int32, device=device), torch.zeros(nbl, dtype=torch.int32, device=device),
+                torch.full((1,), nbl * bm, dtype=torch.int32, device=device))
+    t = _rq_static.get(device)
+    if t is None:
+        t = _rq_static[device] = (torch.arange(_RQ_MAX_SLOTS, dtype=torch.int32, device=device), torch.zeros(_RQ_MAX_SLOTS // 16, dtype=torch.int32, device=device),
+                                  torch.arange(1, _RQ_MAX_SLOTS + 1, dtype=torch.int32, device=device))   # ntpp = slots: entry slots - 1
+    return t[0][: nbl * bm], t[1][:nbl], t[2][nbl * bm - 1 : nbl * bm]
+
+
+def _rq_plan(n: int, k: int, m: int) -> tuple[bool, int]:
+    """(LDS large-M kernel, nw of the streaming kernel) for an rq dense GEMM of m rows: radeon_ops.qgemm.plan per power-of-two M bucket."""
+    return _rq_planned(n, k, 1 << max(0, (m - 1).bit_length()))
+
+
 def _rdna_hybrid_w4a16_apply_impl(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
@@ -785,17 +822,20 @@ def _rdna_hybrid_w4a16_apply_impl(
     K = x_2d.shape[1]
     N = w_q.shape[0]
 
-    if rq_w is not None and M >= _RADEON_BIG_MIN_M:   # radeon_ops rq LDS large-M kernel (VLLM_ROCM_RADEON_HYBRID_BIG)
-        with _profile_scope(f"radeon_rq_big_w4a16 {M}x{N}x{K}"):
+    if rq_w is not None and (M >= _RADEON_RQ_MIN_M or w_q.size(1) == 0):   # radeon_ops rq (VLLM_ROCM_RADEON_HYBRID_BIG); w_q [N, 0]: rq-only layer
+        N = rq_w.size(1)
+        use_lds, nw = _rq_plan(N, K, M)
+        with _profile_scope(f"radeon_rq_{'big' if use_lds else 'stream'}_w4a16 {M}x{N}x{K}"):
             rq = torch.ops.rq
-            bm = 128
+            bm = 128 if use_lds else 16
             nbl = (M + bm - 1) // bm
-            sorted_ids = torch.arange(nbl * bm, dtype=torch.int32, device=x_2d.device)   # ids >= M: padding slots
-            eids = torch.zeros(nbl, dtype=torch.int32, device=x_2d.device)
-            ntpp = torch.full((1,), nbl * bm, dtype=torch.int32, device=x_2d.device)
+            sorted_ids, eids, ntpp = _rq_routing(x_2d.device, nbl, bm)
             xq, xs, xsum = rq.quant_x(x_2d.contiguous(), 0)
             out = torch.empty(M, N, dtype=x_2d.dtype, device=x_2d.device)
-            rq.gemm_big(xq, xs, xsum, rq_w, rq_s, out, None, sorted_ids, eids, ntpp, 1, M, 0, rq_zp)   # rq_zp: asymmetric zero points (None = 8)
+            if use_lds:
+                rq.gemm_big(xq, xs, xsum, rq_w, rq_s, out, None, sorted_ids, eids, ntpp, 1, M, 0, rq_zp)   # rq_zp: asymmetric zero points (None = 8)
+            else:
+                rq.gemm(xq, xs, xsum, rq_w, rq_s, out, None, sorted_ids, eids, ntpp, 1, M, 0, None, None, None, nw, 0, rq_zp)
             if bias is not None:
                 out.add_(bias)
             return out
@@ -999,6 +1039,8 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
                 _, _, w_zp_t = self._get_weight_params(layer)          # [N // 8, G] int32 packed along N (permuted above)
                 z = unpack_quantized_values_into_int32(w_zp_t.data, c.weight_type, packed_dim=0).to(torch.uint8)   # [N, G]
                 layer.register_buffer("radeon_rq_zp", z.reshape(n_ // 16, 16, g_).permute(0, 2, 1).contiguous().unsqueeze(0), persistent=False)
+            if n_ >= _RADEON_RQ_ONLY_N:   # rq runs every M on this layer: drop the skinny copy (keep [N, 0] for the output width)
+                self._transform_param(layer, self.w_q_name, lambda x: torch.empty((n_, 0), dtype=x.dtype, device=x.device))
 
         kernel_config = get_current_vllm_config().kernel_config
         if kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable":
