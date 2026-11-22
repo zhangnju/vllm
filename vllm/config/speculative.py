@@ -544,11 +544,13 @@ class SpeculativeConfig:
     If `None`, use the value from the draft model's Hugging Face config."""
 
     # Advanced control
-    draft_lm_head_quantization: Literal["fp8", "nvfp4"] | None = None
+    draft_lm_head_quantization: Literal["fp8", "nvfp4", "int4"] | None = None
     """Quantize the drafter's copy of a target lm_head it shares (EAGLE, MTP
     and DeepSeek-V4/V4.1 DSpark). "fp8" uses per-row weight and per-token
     activation scales on the platform's FP8 linear kernel; "nvfp4" is
-    weight-only on the platform's W4A16 kernel. The target verifies with its
+    weight-only on the platform's W4A16 kernel; "int4" is weight-only
+    symmetric int4 (one scale per 128 input channels) on the platform's W4A16
+    kernel (on RDNA4 with the Radeon hybrid W4A16 kernel: 3.7x a bf16 head). The target verifies with its
     own head, so only the acceptance length can change."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits

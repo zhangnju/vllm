@@ -231,6 +231,10 @@ def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead
         )
     # Online methods take their output dtype from the default dtype, which is
     # only the model dtype while the model itself is being built.
+    if quantization == "int4" and "int4" not in _LM_HEAD_METHODS:   # int4.py imports this module: register on first use
+        from vllm.model_executor.layers.quantization.online.int4 import Int4PerGroup128SymLMHeadMethod
+
+        _LM_HEAD_METHODS["int4"] = Int4PerGroup128SymLMHeadMethod
     dtype = lm_head.weight.dtype
     with set_default_torch_dtype(dtype):
         head = ParallelLMHead(
@@ -260,13 +264,14 @@ _SOURCES: WeakKeyDictionary[Module, tuple[ParallelLMHead, str]] = WeakKeyDiction
 
 
 def quantized_lm_head_copy(
-    lm_head: ParallelLMHead, quantization: Literal["fp8", "nvfp4"]
+    lm_head: ParallelLMHead, quantization: Literal["fp8", "nvfp4", "int4"]
 ) -> ParallelLMHead:
     """A ParallelLMHead holding this rank's shard of `lm_head`, quantized.
 
     "fp8" uses per-row weight and per-token activation scales on the platform's
     FP8 linear kernel; "nvfp4" is weight-only on the
-    platform's W4A16 kernel. `lm_head` is left
+    platform's W4A16 kernel; "int4" is weight-only symmetric int4, one scale per 128
+    input channels, on the platform's W4A16 kernel. `lm_head` is left
     unchanged and no bf16 copy of its weight is made. The copy is derived state:
     `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.
     """

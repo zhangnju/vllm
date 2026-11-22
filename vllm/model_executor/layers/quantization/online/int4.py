@@ -16,6 +16,9 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     OnlineLMHeadMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    QuantKey,
+    ScaleDesc,
     kInt4Static32Asym,
     pack_quantized_values_into_int32,
 )
@@ -104,3 +107,43 @@ class Int4PerGroup32AsymLMHeadMethod(OnlineLMHeadMethodBase):
         self, weight: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return quantize_int4_to_mp_layout(weight, self.group_size)
+
+
+_INT4_MAX = 7
+# Symmetric int4 with one scale per 128 input channels, stored as uint4b8 (code = q + 8): the GPTQ layout every W4A16 kernel takes,
+# including the Radeon rq kernels (RDNA hybrid W4A16 with VLLM_ROCM_RADEON_HYBRID_BIG runs an N >= 8192 layer on rq at every M).
+kInt4Static128Sym = QuantKey(scalar_types.uint4b8, scale=ScaleDesc(torch.float16, True, GroupShape(1, 128)), symmetric=True)
+
+
+@torch.no_grad()
+def quantize_int4_sym_to_mp_layout(weight: torch.Tensor, group_size: int, chunk_rows: int = 8192) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """Symmetric int4 quantization of `weight` [N, K] into the `MPLinearKernel` uint4b8 layout: the codes (q + 8) packed along K
+    (int32 [N, K // 8]) and the scales [N, K // group_size] (absmax / 7, in the weight dtype); no zero points."""
+    n, k = weight.shape
+    packed = torch.empty(n, k // _PACK_FACTOR, dtype=torch.int32, device=weight.device)
+    scales = torch.empty(n, k // group_size, dtype=weight.dtype, device=weight.device)
+    for start in range(0, n, chunk_rows):
+        rows = slice(start, start + chunk_rows)
+        groups = weight[rows].float().view(-1, k // group_size, group_size)
+        scale = (groups.abs().amax(dim=-1) / _INT4_MAX).clamp(min=torch.finfo(weight.dtype).tiny).to(weight.dtype)
+        scales[rows] = scale
+        codes = (groups / scale.float().unsqueeze(-1)).round().clamp(-_INT4_MAX - 1, _INT4_MAX) + 8   # round against the stored scale
+        packed[rows] = pack_quantized_values_into_int32(codes.to(torch.int32).view(-1, k), scalar_types.uint4b8, packed_dim=1)
+    return packed, scales, None
+
+
+class Int4PerGroup128SymLMHeadMethod(OnlineLMHeadMethodBase):
+    """Weight-only symmetric int4 lm_head (uint4b8), one scale per 128 input channels -- e.g. a speculative drafter's private head
+    (`draft_lm_head_quantization="int4"`): the target verifies with its own head, so only the acceptance length can change."""
+
+    scheme = "int4_per_group_128_sym"
+    weight_quant_key = kInt4Static128Sym
+    activation_quant_key = None
+    weight_type = scalar_types.uint4b8
+    group_size = 128
+    zero_points = False
+    n_align = _PACK_FACTOR
+    k_align = group_size
+
+    def quantize(self, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        return quantize_int4_sym_to_mp_layout(weight, self.group_size)
