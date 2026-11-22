@@ -5,6 +5,9 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import functools
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -562,6 +565,24 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        self._radeon_kvq = (
+            os.environ.get("VLLM_ROCM_RADEON_KVQ", "0") == "1"
+            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and head_size == 256 and num_heads == 8 * num_kv_heads
+            and self.sliding_window == (-1, -1) and not self.logits_soft_cap and self.alibi_slopes is None and self.sinks is None
+            and self.chunk_lookback == -1 and _radeon_kvq_available()
+        )
+        if self._radeon_kvq:
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+            self._radeon_kvq_max_len = cfg.model_config.max_model_len if cfg is not None else 32768
+            self._radeon_kvq_ns: dict[int, int] = {}
+            if envs.VLLM_BATCH_INVARIANT:   # the split count must not follow the batch size; radeon_ops dispatchers follow the same mode
+                import radeon_ops
+
+                radeon_ops.set_batch_invariant(True)
+            logger.info_once("TritonAttention: decode batches over the int8 per-token-head KV cache run radeon_ops paged_decode_kvq (VLLM_ROCM_RADEON_KVQ)")
         if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             from vllm.v1.attention.ops.int4_per_token_head import init_rht_signs
 
@@ -663,6 +684,16 @@ class TritonAttentionImpl(AttentionImpl):
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
             q_descale = k_descale = v_descale = None
+            if self._radeon_kvq and attn_metadata.max_query_len == 1:
+                # RADEON (VLLM_ROCM_RADEON_KVQ=1): pure decode batch over the int8 per-token-head cache -> radeon_ops paged_decode_kvq (int8 q.k dot4, no
+                # dequantised tiles; 1.2-2.7x this backend's Triton int8 kernel, 1.4-1.9x its bf16 kernel at 16-32k context on R9700)
+                q = query[:num_actual_tokens]
+                out = output[:num_actual_tokens].view(q.shape)
+                hs = self.head_size
+                torch.ops.radeon.paged_decode_kvq(q if q.is_contiguous() else q.contiguous(), key_cache[..., :hs], value_cache[..., :hs], k_scale_cache,
+                                                  v_scale_cache, attn_metadata.block_table, attn_metadata.seq_lens, self.scale,
+                                                  self._radeon_kvq_splits(num_actual_tokens), out)
+                return output
         # FP8 per-tensor / auto path (original flow).
         else:
             kv_cache = kv_cache.transpose(1, 2)
@@ -747,6 +778,18 @@ class TritonAttentionImpl(AttentionImpl):
         )
 
         return output
+
+    def _radeon_kvq_splits(self, num_seqs: int) -> int:
+        """KV splits per sequence for radeon paged_decode_kvq: a function of the batch size and max_model_len only (CUDA-graph safe: the split ranges are derived
+        from seq_lens on the device; a graph captured with short contexts stays right for long ones).  VLLM_BATCH_INVARIANT: the split count of one sequence."""
+        if envs.VLLM_BATCH_INVARIANT:
+            num_seqs = 1
+        ns = self._radeon_kvq_ns.get(num_seqs)
+        if ns is None:
+            cus = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count   # RDNA reports WGPs
+            want = -(-(4 * cus) // (num_seqs * self.num_kv_heads))
+            ns = self._radeon_kvq_ns[num_seqs] = max(1, min(want, -(-self._radeon_kvq_max_len // 256)))
+        return ns
 
     def _pth_key_value_caches(
         self, kv_cache: torch.Tensor
@@ -903,3 +946,14 @@ class TritonAttentionImpl(AttentionImpl):
             query_out=query_out,
             key_out=key_out,
         )
+
+
+@functools.cache
+def _radeon_kvq_available() -> bool:
+    try:
+        from radeon_ops.torch_ops import load_radeon_torch_ops
+
+        load_radeon_torch_ops()
+        return hasattr(torch.ops.radeon, "paged_decode_kvq")
+    except Exception:
+        return False
