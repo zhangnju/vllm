@@ -70,6 +70,8 @@ class Fp8MoeBackend(Enum):
     HUMMING = "HUMMING"
     TRITON = "TRITON"
     RADEON = "RADEON"
+    # radeon_ops W8A16 (bf16 activations, software e4m3) on RDNA3 gfx11, which has no fp8 arithmetic (VLLM_ROCM_RADEON_MOE=1).
+    RADEON_W8A16 = "RADEON_W8A16"
     BATCHED_TRITON = "BATCHED_TRITON"
     AITER = "AITER"
     VLLM_CUTLASS = "VLLM_CUTLASS"
@@ -104,6 +106,8 @@ def _get_priority_backends(
     _AVAILABLE_BACKENDS = [
         # Radeon fp8-WMMA kernel (gfx1201, VLLM_ROCM_RADEON_MOE=1), gated by _supports_current_device().
         Fp8MoeBackend.RADEON,
+        # radeon_ops W8A16 kernels (gfx11, VLLM_ROCM_RADEON_MOE=1): ~8-10x the emulated W8A8 Triton path on a W7900.
+        Fp8MoeBackend.RADEON_W8A16,
         Fp8MoeBackend.AITER,
         Fp8MoeBackend.FLASHINFER_TRTLLM,
         Fp8MoeBackend.FLASHINFER_CUTLASS,
@@ -228,6 +232,13 @@ def backend_to_kernel_cls(
         )
 
         return [RadeonFp8Experts]
+
+    elif backend == Fp8MoeBackend.RADEON_W8A16:
+        from vllm.model_executor.layers.fused_moe.experts.radeon_fp8_moe import (
+            RadeonFp8W8A16Experts,
+        )
+
+        return [RadeonFp8W8A16Experts]
 
     elif backend == Fp8MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
@@ -713,6 +724,10 @@ def convert_to_fp8_moe_kernel_format(
         w13, w13_scale, w2, w2_scale = prepare_fp8_w8a8_moe_layer_for_cpu(
             w13, w2, w13_scale, w2_scale
         )
+    elif fp8_backend == Fp8MoeBackend.RADEON_W8A16:
+        # weights as stored ([E, R, K] e4m3, gate rows then up rows); radeon_ops takes bf16 block scales
+        w13_scale = w13_scale.to(torch.bfloat16).contiguous()
+        w2_scale = w2_scale.to(torch.bfloat16).contiguous()
     elif fp8_backend == Fp8MoeBackend.RADEON:
         # [E, R, K] e4m3 -> WMMA fragment order (same shape); block scales as contiguous f32
         packed = []
@@ -777,8 +792,8 @@ def make_fp8_moe_quant_config(
             block_shape=block_shape,
         )
 
-    # MARLIN and CPU (W8A16) are mixed precision W8A16 configs.
-    if fp8_backend == Fp8MoeBackend.MARLIN or fp8_backend == Fp8MoeBackend.CPU:
+    # MARLIN, CPU and RADEON_W8A16 are mixed precision W8A16 configs.
+    if fp8_backend in (Fp8MoeBackend.MARLIN, Fp8MoeBackend.CPU, Fp8MoeBackend.RADEON_W8A16):
         return fp8_w8a16_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
