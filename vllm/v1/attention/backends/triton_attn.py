@@ -567,7 +567,7 @@ class TritonAttentionImpl(AttentionImpl):
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
         self._radeon_kvq = (
             os.environ.get("VLLM_ROCM_RADEON_KVQ", "0") == "1"
-            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and self._kv_quant_mode in (KVQuantMode.INT8_PER_TOKEN_HEAD, KVQuantMode.FP8_PER_TOKEN_HEAD)
             and head_size == 256 and num_heads == 8 * num_kv_heads
             and self.sliding_window == (-1, -1) and not self.logits_soft_cap and self.alibi_slopes is None and self.sinks is None
             and self.chunk_lookback == -1 and _radeon_kvq_available()
@@ -582,7 +582,12 @@ class TritonAttentionImpl(AttentionImpl):
                 import radeon_ops
 
                 radeon_ops.set_batch_invariant(True)
-            logger.info_once("TritonAttention: decode batches over the int8 per-token-head KV cache run radeon_ops paged_decode_kvq (VLLM_ROCM_RADEON_KVQ)")
+            # decode batches above this many sequences stay on vLLM's Triton kernel (R9700, radeon_ops >= 6f97c0e with WMMA q.k: int8 still 1.13x Triton int8 at 32
+            # sequences x 32k, fp8 0.87x Triton fp8 there); VLLM_BATCH_INVARIANT: no switch by batch size
+            fp8_kv = self._kv_quant_mode == KVQuantMode.FP8_PER_TOKEN_HEAD
+            self._radeon_kvq_max_seqs = 1 << 30 if envs.VLLM_BATCH_INVARIANT else int(os.environ.get("VLLM_ROCM_RADEON_KVQ_MAX_SEQS", "16" if fp8_kv else "64"))
+            logger.info_once("TritonAttention: decode batches of up to %d sequences over the 8-bit per-token-head KV cache run radeon_ops paged_decode_kvq (VLLM_ROCM_RADEON_KVQ)",
+                             self._radeon_kvq_max_seqs)
         if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             from vllm.v1.attention.ops.int4_per_token_head import init_rht_signs
 
@@ -684,9 +689,9 @@ class TritonAttentionImpl(AttentionImpl):
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
             q_descale = k_descale = v_descale = None
-            if self._radeon_kvq and attn_metadata.max_query_len == 1:
-                # RADEON (VLLM_ROCM_RADEON_KVQ=1): pure decode batch over the int8 per-token-head cache -> radeon_ops paged_decode_kvq (int8 q.k dot4, no
-                # dequantised tiles; 1.2-2.7x this backend's Triton int8 kernel, 1.4-1.9x its bf16 kernel at 16-32k context on R9700)
+            if self._radeon_kvq and attn_metadata.max_query_len == 1 and attn_metadata.seq_lens.shape[0] <= self._radeon_kvq_max_seqs:
+                # RADEON (VLLM_ROCM_RADEON_KVQ=1): pure decode batch over the int8 / fp8 per-token-head cache -> radeon_ops paged_decode_kvq (int8 q.k dot4 or
+                # bf16 dot2 on e4m3, no dequantised tiles; up to 8 sequences on R9700: 1.1-2.7x this backend's Triton 8-bit kernels, 1.1-2.0x its bf16 kernel at 4-32k)
                 q = query[:num_actual_tokens]
                 out = output[:num_actual_tokens].view(q.shape)
                 hs = self.head_size
