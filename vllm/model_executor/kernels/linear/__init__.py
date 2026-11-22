@@ -213,6 +213,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
     B12xTensorFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.radeon_fp8_linear import (
+    RadeonFp8BlockScaledMMKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
     CPUFp8BlockScaledMMKernel,
     CPUFp8ChannelWiseScaledMMLinearKernel,
@@ -537,6 +540,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         BlockWiseTorchFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        RadeonFp8BlockScaledMMKernel,  # W8A16 on gfx11 (no fp8 arithmetic), VLLM_ROCM_RADEON_FP8_LINEAR=1
         AiterFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,
     ],
