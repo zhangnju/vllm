@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""OCP MXFP4 (e2m1 + e8m0 per 32) MoE experts on radeon_ops (RDNA4, gfx1201): W4A16 -- bf16 activations, the checkpoint's packed weights read as is.
+"""OCP MXFP4 (e2m1 + e8m0 per 32) MoE experts on radeon_ops (RDNA4 gfx1201, RDNA3 gfx11): W4A16 -- bf16 activations, the checkpoint's packed weights read as is.
 
-torch.ops.radeon.moe_ffn_mxfp4 runs decode-sized batches (M <= VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M, default 48) on the fused MXFP4 decode GEMV, up to
+torch.ops.radeon.moe_ffn_mxfp4 runs decode-sized batches (M <= VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M, default 48 on gfx1201, 24 on gfx11) on the fused MXFP4 decode GEMV, up to
 VLLM_ROCM_RADEON_MXFP4_DG_MAX_M (default 896) tokens on the grouped weight-streaming WMMA kernels (16-row blocks) and larger ones on the large-M bf16-WMMA kernel
 (gate-up + SiLU, down, top-k reduce); weights [E, 2N, K/2] / [E, K, N/2] uint8 (gate rows first), scales e8m0
 [E, 2N, K/32] / [E, K, N/32].  Enabled with VLLM_ROCM_RADEON_MOE=1.  Checkpoints that also quantise activations (Quark w_mxfp4_a_mxfp4, W4A4) run with
@@ -28,8 +28,17 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey, kMxfp4Static
 from vllm.platforms import current_platform
 
-# R9700, E 256 / H 2048 / inter 512 (one MoE layer): GEMV < grouped from ~48 tokens, grouped < large-M from ~1024
-_DECODE_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M", "48"))
+# R9700, E 256 / H 2048 / inter 512 (one MoE layer): GEMV < grouped from ~48 tokens, grouped < large-M from ~1024; W7900 (gfx11): GEMV < grouped from ~24 tokens (the op caps
+# the grouped kernel at 32 routed rows per expert there)
+def _on_gfx11() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx11
+
+    return on_gfx11()
+
+
+_DECODE_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_DECODE_MAX_M", "24" if _on_gfx11() else "48"))
 _DG_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_DG_MAX_M", "896"))
 
 
@@ -97,7 +106,7 @@ class RadeonMxfp4Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_batch_invariance() -> bool:
-        return True   # radeon_ops batch-invariant mode (on with VLLM_BATCH_INVARIANT): moe_ffn_mxfp4 skips its decode GEMV; the grouped and large-M kernels are bit-identical
+        return True   # radeon_ops batch-invariant mode (on with VLLM_BATCH_INVARIANT): moe_ffn_mxfp4 skips its decode GEMV (and on gfx11 the grouped kernel): one bit-identical family
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
