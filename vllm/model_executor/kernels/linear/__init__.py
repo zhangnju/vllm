@@ -215,6 +215,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm.radeon_fp8_linear import (
     RadeonFp8BlockScaledMMKernel,
+    RadeonPtpcFp8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
     CPUFp8BlockScaledMMKernel,
@@ -500,6 +501,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         HummingFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        RadeonPtpcFp8ScaledMMLinearKernel,  # per-token x per-channel on gfx1201 native fp8 WMMA, VLLM_ROCM_RADEON_FP8_LINEAR=1
         AiterHipbMMPerTokenFp8ScaledMMLinearKernel,
         AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
         AiterPerTokenFp8ScaledMMLinearKernel,
