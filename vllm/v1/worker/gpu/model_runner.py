@@ -427,6 +427,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_config=self.vllm_config.model_config,
                 )
             log_layer_backends(self.model, self.vllm_config.model_config)
+            # VLLM_ROCM_RADEON_LMHEAD=int4 | fp8: the target's bf16 lm_head quantized (before a drafter shares it)
+            from vllm.model_executor.layers.quantization.online.radeon_lm_head import radeon_quantize_target_lm_heads
+
+            radeon_quantize_target_lm_heads(self.model)
             if self.lora_config:
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
