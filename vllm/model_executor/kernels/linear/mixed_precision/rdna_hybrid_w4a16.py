@@ -619,6 +619,9 @@ def triton_w4a16_skinny_fmt_gemm(
 # ---------------------------------------------------------------------------
 
 
+_PACK_CHUNK_ROWS = 16384
+
+
 def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     """Pack uint4 values into ExLlama shuffle format: [N, K] -> [N, K//8] int32.
 
@@ -626,17 +629,20 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     """
     N_dim, K_dim = w_uint4.shape
     assert K_dim % 8 == 0
-    g = w_uint4.to(torch.uint8).view(N_dim, K_dim // 8, 8).to(torch.int32)
-    return (
-        g[:, :, 0]
-        | (g[:, :, 2] << 4)
-        | (g[:, :, 4] << 8)
-        | (g[:, :, 6] << 12)
-        | (g[:, :, 1] << 16)
-        | (g[:, :, 3] << 20)
-        | (g[:, :, 5] << 24)
-        | (g[:, :, 7] << 28)
-    )
+    out = torch.empty(N_dim, K_dim // 8, dtype=torch.int32, device=w_uint4.device)
+    for r0 in range(0, N_dim, _PACK_CHUNK_ROWS):   # row chunks: a [N, K / 8, 8] int32 transient is 1.9 GiB for a 248k-row lm_head
+        g = w_uint4[r0 : r0 + _PACK_CHUNK_ROWS].to(torch.uint8).view(-1, K_dim // 8, 8).to(torch.int32)
+        out[r0 : r0 + _PACK_CHUNK_ROWS] = (
+            g[:, :, 0]
+            | (g[:, :, 2] << 4)
+            | (g[:, :, 4] << 8)
+            | (g[:, :, 6] << 12)
+            | (g[:, :, 1] << 16)
+            | (g[:, :, 3] << 20)
+            | (g[:, :, 5] << 24)
+            | (g[:, :, 7] << 28)
+        )
+    return out
 
 
 # gfx11 row strides alias in the vector caches when they land on a power-of-two
@@ -991,13 +997,22 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         w_q_raw = getattr(layer, self.w_q_name)
 
-        unpacked = unpack_quantized_values_into_int32(
-            w_q_raw.data, c.weight_type, packed_dim=w_q_raw.packed_dim
-        )
         # AWQ weights arrive as (K, N) with output_dim=1;
         # compressed-tensors arrive as (N, K) with output_dim=0.
-        if getattr(w_q_raw, "output_dim", 0) != 0:
-            unpacked = unpacked.t().contiguous()
+        if getattr(w_q_raw, "output_dim", 0) == 0 and w_q_raw.packed_dim == 1:
+            # (N, K // 8) rows: unpack in row chunks straight to uint8 (a full int32 [N, K] is 1.9 GiB for a 248k-row lm_head)
+            n_rows = w_q_raw.data.shape[0]
+            unpacked = torch.empty(n_rows, w_q_raw.data.shape[1] * 8, dtype=torch.uint8, device=w_q_raw.data.device)
+            for r0 in range(0, n_rows, _PACK_CHUNK_ROWS):
+                unpacked[r0 : r0 + _PACK_CHUNK_ROWS] = unpack_quantized_values_into_int32(
+                    w_q_raw.data[r0 : r0 + _PACK_CHUNK_ROWS], c.weight_type, packed_dim=1
+                ).to(torch.uint8)
+        else:
+            unpacked = unpack_quantized_values_into_int32(
+                w_q_raw.data, c.weight_type, packed_dim=w_q_raw.packed_dim
+            )
+            if getattr(w_q_raw, "output_dim", 0) != 0:
+                unpacked = unpacked.t().contiguous()
 
         # Store as int8; Triton reinterprets via .view(torch.int32) at apply time.
         w_q_skinny = pack_skinny_int4(unpacked)
