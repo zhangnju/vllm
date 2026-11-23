@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MXFP4 linear kernel for RDNA4 (gfx1201) on radeon_ops: W4A16 -- bf16 activations, the checkpoint's packed weights ([N, K/2] uint8 E2M1 codes,
+"""MXFP4 linear kernel for RDNA4 (gfx1201) and RDNA3 (gfx11) on radeon_ops: W4A16 -- bf16 activations, the checkpoint's packed weights ([N, K/2] uint8 E2M1 codes,
 [N, K/32] uint8 E8M0 scales) read as is.
 
 torch.ops.radeon.linear_mxfp4 routes on the number of activation rows M:
-  M <= VLLM_ROCM_RADEON_MXFP4_LINEAR_GEMV_MAX_M (4):  streaming GEMV (one MX group per 16-byte load, decoded once per token batch)
-  M <= VLLM_ROCM_RADEON_MXFP4_LINEAR_DG_MAX_M (16):   weight-streaming bf16 WMMA (16-token blocks)
+  M <= VLLM_ROCM_RADEON_MXFP4_LINEAR_GEMV_MAX_M (4; 8 on gfx11):  streaming GEMV (one MX group per 16-byte load, decoded once per token batch)
+  M <= VLLM_ROCM_RADEON_MXFP4_LINEAR_DG_MAX_M (16; 32 on gfx11):  weight-streaming bf16 WMMA (16-token blocks)
   M <= VLLM_ROCM_RADEON_MXFP4_LINEAR_BIG_MAX_M (512): LDS-tiled bf16-WMMA kernel with in-register dequant
   otherwise (prefill):                                 dequantise into a persistent bf16 scratch copy + hipBLASLt
 Enabled with VLLM_ROCM_RADEON_MXFP4_LINEAR=1.  W4A4 checkpoints (Quark w_mxfp4_a_mxfp4) run with unquantised bf16 activations, as the radeon MXFP4 MoE path.
@@ -27,9 +27,18 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .base import MxFp4LinearKernel, MxFp4LinearLayerConfig
 
-# R9700, Qwen3.8-27B shapes (cold weights): GEMV 540-600 GB/s at M <= 4; WMMA streaming best at M 8-16; LDS-tiled to ~512; dequant + hipBLASLt above
-_GEMV_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_LINEAR_GEMV_MAX_M", "4"))
-_DG_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_LINEAR_DG_MAX_M", "16"))
+# R9700, Qwen3.8-27B shapes (cold weights): GEMV 540-600 GB/s at M <= 4; WMMA streaming best at M 8-16; LDS-tiled to ~512; dequant + hipBLASLt above.
+# W7900 (gfx11, radeon_ops >= 5dbce35): GEMV best to M 8, WMMA streaming at M 16-32 (1.4-2.1x the LDS-tiled kernel at 16), LDS-tiled from 64.
+def _on_gfx11() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx11
+
+    return on_gfx11()
+
+
+_GEMV_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_LINEAR_GEMV_MAX_M", "8" if _on_gfx11() else "4"))
+_DG_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_LINEAR_DG_MAX_M", "32" if _on_gfx11() else "16"))
 _BIG_MAX_M = int(os.environ.get("VLLM_ROCM_RADEON_MXFP4_LINEAR_BIG_MAX_M", "512"))
 
 
@@ -64,7 +73,7 @@ direct_register_custom_op(
 
 
 class RadeonMxFp4LinearKernel(MxFp4LinearKernel):
-    """MXFP4 W4A16 linear on radeon_ops for RDNA4 (see module docstring)."""
+    """MXFP4 W4A16 linear on radeon_ops for RDNA4 / RDNA3 (see module docstring)."""
 
     @classmethod
     def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
@@ -72,10 +81,10 @@ class RadeonMxFp4LinearKernel(MxFp4LinearKernel):
             return False, "only targets ROCm"
         if os.environ.get("VLLM_ROCM_RADEON_MXFP4_LINEAR", "0") != "1":
             return False, "VLLM_ROCM_RADEON_MXFP4_LINEAR is not set"
-        from vllm.platforms.rocm import on_gfx1201
+        from vllm.platforms.rocm import on_gfx11, on_gfx1201
 
-        if not on_gfx1201():
-            return False, "requires RDNA4 (gfx1201)"
+        if not (on_gfx1201() or on_gfx11()):
+            return False, "requires RDNA4 (gfx1201) or RDNA3 (gfx11)"
         if not _radeon_linear_mxfp4_available():
             return False, "radeon_ops torch.ops.radeon.linear_mxfp4 is not available"
         return True, None
