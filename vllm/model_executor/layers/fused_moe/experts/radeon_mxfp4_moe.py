@@ -56,9 +56,9 @@ def _radeon_mxfp4_available() -> bool:
 def radeon_mxfp4_kernel_available() -> bool:
     if not current_platform.is_rocm() or not envs.VLLM_ROCM_RADEON_MOE:
         return False
-    from vllm.platforms.rocm import on_gfx1201
+    from vllm.platforms.rocm import on_gfx11, on_gfx1201
 
-    return on_gfx1201() and _radeon_mxfp4_available()
+    return (on_gfx1201() or on_gfx11()) and _radeon_mxfp4_available()
 
 
 class RadeonMxfp4Experts(mk.FusedMoEExpertsModular):

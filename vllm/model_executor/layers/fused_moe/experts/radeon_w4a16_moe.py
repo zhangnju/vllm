@@ -42,14 +42,14 @@ _GROUP = 128
 def radeon_w4a16_kernel_available() -> bool:
     if not current_platform.is_rocm() or not envs.VLLM_ROCM_RADEON_MOE:
         return False
-    from vllm.platforms.rocm import on_gfx1201
+    from vllm.platforms.rocm import on_gfx11, on_gfx1201
 
     if radeon_rq.enabled():
         try:
             radeon_rq.rq_ops()
         except Exception:
             return False
-        return on_gfx1201()
+        return on_gfx1201() or (on_gfx11() and radeon_rq.act_id() == 0)   # rq on RDNA3: the int8-activation atom (no fp8 WMMA; iu4 not ported)
     return (
         on_gfx1201()
         and hasattr(torch.ops, "_rocm_C")
@@ -238,7 +238,8 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         if up_split:    # measured faster: the gate/up/SiLU GEMM with the bf16 GLU epilogue (streaming nw or the LDS kernel) + quant_x, bit-identical to the fused epilogue
             act_bf = workspace13.view(-1)[: num_slots * inter].view(num_slots, inter)
             if up_lds:
-                sid64, eid64, np64 = moe_align_block_size(self._topk_ids, 64, E, None)
+                bm_up = int(rq.block_m(radeon_rq.EPI_GLU))   # the LDS kernel's block: 64 for GLU
+                sid64, eid64, np64 = moe_align_block_size(self._topk_ids, bm_up, E, None)
                 rq.gemm_big(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_bf, None, sid64, eid64, np64, top_k, num_slots, radeon_rq.EPI_GLU, z1)
             else:
                 rq.gemm(xq, xs, xsum, w1.view(torch.uint8), self.w1_scale, act_bf, None, sorted_ids, expert_ids, num_post, top_k, num_slots, radeon_rq.EPI_GLU,
@@ -250,7 +251,8 @@ class RadeonW4A16Experts(mk.FusedMoEExpertsModular):
         down = workspace2.view(-1)[: num_slots * K].view(num_slots, K)
         tw = topk_weights.reshape(-1).to(torch.float32).contiguous()
         if down_lds:
-            sid128, eid128, np128 = moe_align_block_size(self._topk_ids, 128, E, None)
+            bm_down = int(rq.block_m(radeon_rq.EPI_PLAIN))   # 128 on gfx12, 64 on gfx11
+            sid128, eid128, np128 = moe_align_block_size(self._topk_ids, bm_down, E, None)
             rq.gemm_big(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sid128, eid128, np128, 1, num_slots, radeon_rq.EPI_PLAIN, z2)
         else:
             rq.gemm(aq, a_s, a_sum, w2.view(torch.uint8), self.w2_scale, down, tw, sorted_ids, expert_ids, num_post, 1, num_slots, radeon_rq.EPI_PLAIN, None,
